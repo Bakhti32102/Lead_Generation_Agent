@@ -1,0 +1,54 @@
+# Environment and secrets
+.env
+*.env
+service_account.json
+credentials.json
+*.json
+!agents.json
+!package.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data and logs
+app/data/
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+logs/
+*.log
+.freebuff/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temp files
+*.tmp
+*.bak
+*.cache
+
+# Dashboard
+dashboard/node_modules/
