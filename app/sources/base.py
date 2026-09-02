@@ -48,6 +48,22 @@ class RawProspect:
     # Extra data specific to the source
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    def validate_name(self) -> bool:
+        """
+        Validate and clean the business name in-place.
+        Returns True if the name is valid, False if the prospect should be rejected.
+        """
+        from app.agents.business_name_validator import validate_business_name
+        cleaned, reason = validate_business_name(self.business_name)
+        if not cleaned:
+            self.metadata["name_rejection_reason"] = reason
+            return False
+        if reason:
+            self.metadata["name_cleaned_from"] = self.business_name[:100]
+            self.metadata["name_cleaning_reason"] = reason
+        self.business_name = cleaned
+        return True
+
 
 class LeadSource(abc.ABC):
     """

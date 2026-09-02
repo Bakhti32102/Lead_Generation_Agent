@@ -16,6 +16,7 @@ from app.sources.google_maps import GoogleMapsSource
 from app.sources.linkedin import LinkedInSource
 from app.sources.public_jobs import PublicJobSource
 from app.sources.serpapi import SerpAPISource
+from app.sources.osm import OpenStreetMapSource
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ class LeadDiscoveryAgent:
         self.repo = LeadRepository()
         self.sources: List[LeadSource] = [
             GoogleMapsSource(),
+            OpenStreetMapSource(),
             GoogleSearchSource(),
             LinkedInSource(),
             PublicJobSource(),
@@ -53,6 +55,7 @@ class LeadDiscoveryAgent:
 
         source_map: Dict[str, tuple] = {
             "google_maps": (GoogleMapsSource, search_google_maps),
+            "openstreetmap": (OpenStreetMapSource, True),  # Always enabled — free, no API key
             "google_search": (GoogleSearchSource, search_google),
             "linkedin": (LinkedInSource, search_linkedin and search_recent_requirements),
             "public_jobs": (PublicJobSource, search_recent_requirements),
@@ -94,7 +97,7 @@ class LeadDiscoveryAgent:
                         country=country,
                         city=city,
                         category=category,
-                        max_results=max_results // 2,  # Split budget across sources
+                        max_results=max_results // 2 if source_name != "openstreetmap" else max_results,
                     )
 
                 all_prospects.extend(results)
@@ -127,6 +130,12 @@ class LeadDiscoveryAgent:
         unique: List[RawProspect] = []
 
         for p in prospects:
+            # Validate business name first
+            if not p.validate_name():
+                reason = p.metadata.get('name_rejection_reason', 'invalid')
+                logger.info(f"Rejected prospect with invalid name: '{p.business_name[:50]}' ({reason})")
+                continue
+
             # Skip if already in database
             existing = self.repo.is_duplicate(
                 website=p.website,

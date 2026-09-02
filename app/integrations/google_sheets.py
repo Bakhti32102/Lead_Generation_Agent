@@ -1,15 +1,17 @@
 """
 Google Sheets integration.
-Uses the official Google Sheets API via a service account.
+Uses the official Google Sheets API via service account or OAuth.
 Acts as the primary human-readable CRM.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from app.config.settings import settings
+from app.config.settings import settings, PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -71,20 +73,67 @@ class GoogleSheetsClient:
         if not self.is_configured:
             raise RuntimeError(
                 "Google Sheets API is not configured. "
-                "Set GOOGLE_SHEET_ID and ensure service_account.json exists."
+                "Set GOOGLE_SHEET_ID and configure auth (OAuth or service account)."
             )
 
-        from google.oauth2.service_account import Credentials
         from googleapiclient.discovery import build
 
-        creds = Credentials.from_service_account_file(
-            str(self._credentials_path),
-            scopes=[
-                "https://www.googleapis.com/auth/spreadsheets",
-            ],
-        )
+        creds = self._get_credentials()
         self._service = build("sheets", "v4", credentials=creds)
         return self._service
+
+    def _get_credentials(self):
+        """Get credentials based on auth mode (OAuth or service account)."""
+        auth_mode = settings.google_sheets.auth_mode.lower()
+
+        if auth_mode == "oauth":
+            return self._get_oauth_credentials()
+        else:
+            return self._get_service_account_credentials()
+
+    def _get_oauth_credentials(self):
+        """Get OAuth2 credentials. Refreshes token if expired."""
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+
+        token_path = settings.google_sheets.token_path
+
+        if not token_path.exists():
+            raise FileNotFoundError(
+                f"OAuth token file not found: {token_path}\n"
+                f"Run: python -m app.auth_sheets"
+            )
+
+        creds = Credentials.from_authorized_user_file(
+            str(token_path),
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+
+        # Refresh if expired
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            # Save refreshed token
+            with open(token_path, "w") as f:
+                json.dump({
+                    "token": creds.token,
+                    "refresh_token": creds.refresh_token,
+                    "token_uri": creds.token_uri,
+                    "client_id": creds.client_id,
+                    "client_secret": creds.client_secret,
+                    "scopes": list(creds.scopes or []),
+                }, f)
+            logger.info("OAuth token refreshed.")
+
+        return creds
+
+    def _get_service_account_credentials(self):
+        """Get service account credentials."""
+        from google.oauth2.service_account import Credentials
+
+        return Credentials.from_service_account_file(
+            str(self._credentials_path),
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
 
     def _get_range(self, range_str: str) -> str:
         """Return the A1 notation with worksheet name."""

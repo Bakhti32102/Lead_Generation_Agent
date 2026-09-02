@@ -3,6 +3,7 @@
 *.env
 service_account.json
 credentials.json
+google_token.json
 *.json
 !agents.json
 !package.json
@@ -33,9 +34,10 @@ ENV/
 
 # Data and logs
 app/data/
-data/*.db
-data/*.sqlite
-data/*.sqlite3
+data/
+*.db
+*.sqlite
+*.sqlite3
 logs/
 *.log
 .freebuff/

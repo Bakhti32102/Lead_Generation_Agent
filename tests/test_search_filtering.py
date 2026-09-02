@@ -126,12 +126,13 @@ class TestSearchRestrictions:
             city="Mumbai",
         )
 
-        perfect_score = scoring.score(perfect)
-        bad_score = scoring.score(bad_match)
+        scored = scoring.score_batch([perfect, bad_match])
+        perfect_result = [s for s in scored if s.business_name == "Glamour Salon"][0]
+        bad_result = [s for s in scored if s.business_name == "Random Gym"][0]
 
-        assert perfect_score > bad_score
-        assert perfect_score >= 80  # Should be high
-        assert bad_score < 30  # Should be low
+        assert perfect_result.lead_score > bad_result.lead_score
+        assert perfect_result.lead_score >= 80  # Should be high
+        assert bad_result.lead_score < 30  # Should be low
 
 
 class TestCategoryExpansion:

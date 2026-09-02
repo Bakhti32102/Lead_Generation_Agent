@@ -14,7 +14,7 @@ from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-BASE_URL = "https://graph.facebook.com/v18.0"
+BASE_URL = "https://graph.facebook.com/v25.0"
 
 
 class WhatsAppClient:

@@ -81,18 +81,14 @@ class EmailClient:
     def _send_gmail_api(
         self, to_email: str, subject: str, body_text: str, body_html: Optional[str]
     ) -> dict:
-        """Send via Gmail API using service account."""
+        """Send via Gmail API using OAuth2 credentials."""
         from base64 import urlsafe_b64encode
         from email.mime.multipart import MIMEMultipart
         from email.mime.text import MIMEText
 
-        from google.oauth2.service_account import Credentials
         from googleapiclient.discovery import build
 
-        creds = Credentials.from_service_account_file(
-            str(settings.google_sheets.credentials_path),
-            scopes=["https://www.googleapis.com/auth/gmail.send"],
-        )
+        creds = self._get_gmail_oauth_credentials()
         service = build("gmail", "v1", credentials=creds)
 
         msg = MIMEMultipart("alternative")
@@ -113,6 +109,45 @@ class EmailClient:
         email_id = result.get("id", "")
         logger.info(f"Gmail API email sent to {to_email}, id={email_id}")
         return {"success": True, "message": "Sent via Gmail API", "id": email_id}
+
+    def _get_gmail_oauth_credentials(self):
+        """Get OAuth2 credentials for Gmail API. Auto-refreshes expired tokens."""
+        import json
+        from pathlib import Path
+
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+
+        # Gmail token file — separate from Google Sheets token (different scopes)
+        gmail_token_path = Path(settings.google_sheets.token_path).parent / "gmail_token.json"
+
+        if not gmail_token_path.exists():
+            raise FileNotFoundError(
+                f"Gmail OAuth token not found: {gmail_token_path}\n"
+                f"Run: python -m app.auth_gmail"
+            )
+
+        creds = Credentials.from_authorized_user_file(
+            str(gmail_token_path),
+            scopes=["https://www.googleapis.com/auth/gmail.send"],
+        )
+
+        # Auto-refresh if expired
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            # Save refreshed token
+            with open(gmail_token_path, "w") as f:
+                json.dump({
+                    "token": creds.token,
+                    "refresh_token": creds.refresh_token,
+                    "token_uri": creds.token_uri,
+                    "client_id": creds.client_id,
+                    "client_secret": creds.client_secret,
+                    "scopes": list(creds.scopes or []),
+                }, f)
+            logger.info("Gmail OAuth token refreshed.")
+
+        return creds
 
     def _send_sendgrid(
         self, to_email: str, subject: str, body_text: str, body_html: Optional[str]

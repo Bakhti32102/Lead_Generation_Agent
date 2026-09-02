@@ -13,9 +13,9 @@ from typing import Optional
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# Project root (one level above this file)
+# Project root (app/config/ settings.py → project root = three levels up)
 # ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
 
@@ -81,6 +81,10 @@ class GoogleMapsConfig:
 
 @dataclass(frozen=True)
 class GoogleSheetsConfig:
+    auth_mode: str = field(default_factory=lambda: _env("GOOGLE_AUTH_MODE", "service_account"))  # "oauth" or "service_account"
+    client_id: str = field(default_factory=lambda: _env("GOOGLE_CLIENT_ID"))
+    client_secret: str = field(default_factory=lambda: _env("GOOGLE_CLIENT_SECRET"))
+    token_file: str = field(default_factory=lambda: _env("GOOGLE_TOKEN_FILE", "google_token.json"))
     service_account_json: str = field(
         default_factory=lambda: _env("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json")
     )
@@ -95,8 +99,19 @@ class GoogleSheetsConfig:
         return path
 
     @property
+    def token_path(self) -> Path:
+        path = Path(self.token_file)
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        return path
+
+    @property
     def is_configured(self) -> bool:
-        return bool(self.sheet_id) and self.credentials_path.exists()
+        if not self.sheet_id:
+            return False
+        if self.auth_mode == "oauth":
+            return bool(self.client_id) and bool(self.client_secret)
+        return self.credentials_path.exists()
 
 
 @dataclass(frozen=True)

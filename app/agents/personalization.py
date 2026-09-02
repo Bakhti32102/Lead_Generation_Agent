@@ -79,9 +79,14 @@ Write the message directly. No subject line. No quotes around the message."""
         else:
             demo_info = "No specific demo available for this business type."
 
+        # Build location string with target city fallback
+        display_city = prospect.city
+        if not display_city and settings.campaign.target_city:
+            display_city = settings.campaign.target_city
+
         user_prompt = f"""Business: {prospect.business_name}
 Category: {prospect.business_category}
-Location: {prospect.city}, {prospect.country}
+Location: {display_city or 'their area'}, {prospect.country or ''}
 Website: {prospect.website or 'No website'}
 Potential problems:
 {prospect.potential_problem}
@@ -112,7 +117,15 @@ Write the personalized outreach message:"""
         my = settings.my_business
 
         name = prospect.business_name
-        city = prospect.city or "your city"
+        # Use target city as fallback when prospect city is empty and location is verified
+        city = prospect.city
+        if not city:
+            loc_verify = prospect.metadata.get("location_verification")
+            if loc_verify and loc_verify.state in ("verified", "probably_verified"):
+                # Location is verified but city field is empty - use target city
+                city = settings.campaign.target_city or "your city"
+            else:
+                city = "your city"
         service = prospect.recommended_service or "AI automation"
         solution = prospect.recommended_ai_solution or "AI agent"
 
