@@ -7,6 +7,9 @@ A lead is skipped when ALL THREE are True:
   3. Has WhatsApp AI automation
 
 Otherwise the lead proceeds with tagged automation_gaps.
+
+Note: All test prospects include a reachable contact channel (email or
+WhatsApp) to pass the strict contact filter before reaching automation check.
 """
 
 import pytest
@@ -23,6 +26,7 @@ class TestPreQualificationFilter:
             business_category="dentist",
             city="Karachi",
             country="Pakistan",
+            email="info@testclinic.com",  # Reachable channel required
         )
         defaults.update(kwargs)
         return RawProspect(**defaults)
@@ -63,7 +67,7 @@ class TestPreQualificationFilter:
         agent = LeadVerificationAgent()
         result = agent.verify(p)
         assert result.metadata["is_verified"] is False
-        assert result.metadata["skip_reason"] == "No contact information available"
+        assert "reachable contact channel" in result.metadata["skip_reason"]
 
     def test_proceed_when_no_chatbot(self):
         """Website exists but no chatbot signals → proceed."""
@@ -153,6 +157,8 @@ class TestPreQualificationFilter:
         p = self._make(
             source="openstreetmap",
             website="https://clinic.com",
+            phone="+923001234567",  # WhatsApp-capable mobile
+            email="",
             metadata={"snippet": "We use whatsapp business api and tidio chat widget"},
         )
         agent = LeadVerificationAgent()

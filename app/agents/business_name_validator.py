@@ -45,6 +45,46 @@ VALID_SUFFIXES = [
     'dental', 'medical', 'care', 'health', 'beauty', 'wellness',
 ]
 
+# Retail / e-commerce name patterns — reject these for beauty categories
+RETAIL_PATTERNS = [
+    r'\b(sephora|mac cosmetics|nyx|ulta|beauty supply)\b',
+    r'\b(cosmetics? store|beauty store|makeup store)\b',
+    r'\b(beauty products?|cosmetics? shop|beauty shop)\b',
+    r'\b(online store|shop online|buy online|order online)\b',
+    r'\b(e[- ]?commerce|ecommerce)\b',
+    r'\b(wholesale|distributor|supplier|importer|exporter)\b',
+    r'\b(retail store|supermarket|hypermarket)\b',
+]
+
+# Retail URLs — reject leads whose website matches these patterns
+RETAIL_URL_INDICATORS = [
+    'sephora.com', 'maccosmetics.com', 'nyxcosmetics.com',
+    'ulta.com', 'beautybay.com', 'amazon.com', 'amazon.',
+    'flipkart.com', 'ebay.com', 'etsy.com',
+]
+
+
+def is_retail_store(name: str, website: str = "") -> bool:
+    """
+    Check if a business name or URL indicates a retail store or e-commerce site.
+    Returns True if the business appears to be retail (not a service provider).
+    """
+    name_lower = name.lower()
+    website_lower = website.lower()
+
+    # Check name against retail patterns
+    for pattern in RETAIL_PATTERNS:
+        if re.search(pattern, name_lower):
+            return True
+
+    # Check website URL against retail indicators
+    if website_lower:
+        for indicator in RETAIL_URL_INDICATORS:
+            if indicator in website_lower:
+                return True
+
+    return False
+
 
 def validate_business_name(name: str) -> tuple[str, str]:
     """

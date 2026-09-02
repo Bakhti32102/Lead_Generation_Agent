@@ -35,6 +35,61 @@ class GoogleSearchSource(LeadSource):
         "germany", "france", "netherlands", "ireland",
     })
 
+    # Retail / e-commerce domains to exclude from beauty searches
+    _RETAIL_DOMAINS: frozenset = frozenset([
+        "sephora.com", "maccosmetics.com", "nyxcosmetics.com",
+        "ulta.com", "beautybay.com", "cultbeauty.co.uk",
+        "lookfantastic.com", "beautylish.com",
+        "amazon.com", "flipkart.com", "ebay.com",
+        "walmart.com", "target.com",
+    ])
+
+    @staticmethod
+    def _is_beauty_category(category: str) -> bool:
+        """Check if the category is beauty-related."""
+        cat_lower = category.lower()
+        beauty_terms = [
+            "beauty", "salon", "spa", "makeup", "cosmetic",
+            "hairdresser", "hair", "nail", "skincare",
+            "bridal", "institut",
+        ]
+        return any(term in cat_lower for term in beauty_terms)
+
+    def _is_retail_result(self, prospect: RawProspect) -> bool:
+        """Check if a search result looks like a retail store or e-commerce site."""
+        name_lower = (prospect.business_name or "").lower()
+        url_lower = (prospect.website or prospect.source_url or "").lower()
+        snippet = str(prospect.metadata.get("snippet", "")).lower()
+
+        # Check URL against retail domains
+        for domain in self._RETAIL_DOMAINS:
+            if domain in url_lower:
+                return True
+
+        # Check business name for retail indicators
+        retail_name_signals = [
+            "sephora", "mac cosmetics", "nyx", "ulta",
+            "beauty supply", "cosmetics store",
+            "online store", "shop online",
+            "wholesale", "distributor", "supplier",
+        ]
+        for signal in retail_name_signals:
+            if signal in name_lower:
+                return True
+
+        # Check snippet for retail signals
+        retail_snippet_signals = [
+            "buy online", "shop now", "add to cart",
+            "free shipping", "product range", "product catalog",
+            "beauty products online", "cosmetics online",
+            "wholesale supplier", "bulk order",
+        ]
+        for signal in retail_snippet_signals:
+            if signal in snippet:
+                return True
+
+        return False
+
     def search(
         self,
         country: str,
@@ -48,10 +103,19 @@ class GoogleSearchSource(LeadSource):
             return []
 
         is_foreign = country.lower().strip() in self.FOREIGN_MARKETS
+        is_beauty = self._is_beauty_category(category)
 
         # Build search queries — foreign markets get contact-rich queries
         # that naturally surface businesses with websites and digital footprints.
-        if is_foreign:
+        # Beauty categories get service-specific queries to avoid retail stores.
+        if is_beauty:
+            # Service-provider focused queries for beauty categories
+            queries = [
+                f"{category} in {city} {country} services appointment booking",
+                f"{category} {city} {country} contact email whatsapp",
+                f"best {category} {city} {country} reviews services",
+            ]
+        elif is_foreign:
             queries = [
                 f"{category} in {city} {country} official website book appointment",
                 f"{category} {city} {country} contact phone email booking online",
@@ -76,6 +140,14 @@ class GoogleSearchSource(LeadSource):
                 if not p.country:
                     p.country = country
             all_results.extend(results)
+
+        # Filter out retail stores for beauty categories
+        if is_beauty:
+            before_count = len(all_results)
+            all_results = [p for p in all_results if not self._is_retail_result(p)]
+            filtered = before_count - len(all_results)
+            if filtered:
+                logger.info(f"Google Search: filtered {filtered} retail results for beauty category")
 
         # Dedup by domain
         seen_domains = set()

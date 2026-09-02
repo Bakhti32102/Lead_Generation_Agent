@@ -10,8 +10,46 @@ import re
 from typing import List, Optional
 
 from app.sources.base import RawProspect
+from app.utils.phone import is_whatsapp_number, has_valid_email, has_reachable_channel
 
 logger = logging.getLogger(__name__)
+
+# ── Retail / E-commerce Blacklist for Beauty Categories ──────────────────
+# Business names, URLs, or snippet keywords that indicate a retail store,
+# product shop, or e-commerce site — NOT a service provider.
+
+RETAIL_NAME_KEYWORDS: list[str] = [
+    # Retail store chains
+    "sephora", "mac cosmetics", "nyx", "ulta", "beauty supply",
+    "cosmetics store", "beauty store", "makeup store",
+    "beauty products", "cosmetics shop", "beauty shop",
+    "beauty outlet", "beauty depot",
+    # E-commerce / online
+    "online store", "shop online", "buy online", "order online",
+    "e-commerce", "ecommerce", "amazon", "flipkart",
+    # Wholesale / distribution
+    "wholesale", "distributor", "supplier", "importer", "exporter",
+    # Generic retail
+    "retail", "supermarket", "hypermarket", "mart",
+]
+
+RETAIL_URL_PATTERNS: list[str] = [
+    "sephora.com", "maccosmetics.com", "nyxcosmetics.com",
+    "ulta.com", "beautybay.com", "cultbeauty.co.uk",
+    "lookfantastic.com", "beautylish.com",
+    "amazon.com", "amazon.", "flipkart.com",
+    "ebay.com", "etsy.com",
+    ".shop/", "/shop", "/store", "/buy", "/order",
+]
+
+RETAIL_SNIPPET_SIGNALS: list[str] = [
+    "buy online", "shop now", "add to cart", "free shipping",
+    "product range", "product catalog", "beauty products online",
+    "cosmetics online", "makeup collection", "skincare products",
+    "hair products", "nail polish", "lipstick", "foundation shade",
+    "beauty brand", "product brand", "retail store",
+    "wholesale supplier", "bulk order", "product distributor",
+]
 
 
 class LeadVerificationAgent:
@@ -24,13 +62,14 @@ class LeadVerificationAgent:
         """
         checks = {
             "has_name": self._check_name(prospect),
-            "has_contact": self._check_contact(prospect),
-            "has_valid_email": self._check_email(prospect),
-            "has_valid_phone": self._check_phone(prospect),
+            "has_email": self._check_email(prospect),
+            "has_whatsapp": self._check_whatsapp(prospect),
+            "has_reachable_channel": self._check_reachable_channel(prospect),
             "has_website": self._check_website(prospect),
             "website_not_blocked": True,  # Verified by actual HTTP check
             "recency_valid": self._check_recency(prospect),
             "source_valid": True,
+            "is_not_retail": self._check_not_retail(prospect),
         }
 
         total = len(checks)
@@ -39,26 +78,34 @@ class LeadVerificationAgent:
         prospect.metadata["verification"] = checks
         prospect.metadata["verification_score"] = f"{passed}/{total}"
 
-        # ── Mandatory Contact Check ──
-        # A lead MUST have at least one valid outreach channel
-        # (phone, email, or website) to be considered for outreach.
-        # Dead-end entries with no way to contact are rejected immediately.
-        has_any_contact = (
-            checks["has_valid_phone"]
-            or checks["has_valid_email"]
-            or checks["has_website"]
-        )
-        if not has_any_contact:
+        # ── Strict Contact Channel Enforcement ──
+        # A lead MUST have a valid Email address OR a direct WhatsApp number
+        # to pass pre-qualification.  Phone-only leads (standard/landline)
+        # and website-only leads are rejected — they have no reachable
+        # outreach channel.
+        if not checks["has_reachable_channel"]:
             prospect.metadata["is_verified"] = False
-            prospect.metadata["skip_reason"] = "No contact information available"
+            prospect.metadata["skip_reason"] = "No reachable contact channel (email or WhatsApp required)"
             logger.info(
-                f"Skipped (no contact): {prospect.business_name} "
-                f"— phone, email, and website all missing or invalid"
+                f"Skipped (no reachable channel): {prospect.business_name} "
+                f"— no valid email or WhatsApp number"
             )
             return prospect
 
-        # Mark as verified if at least name + some contact info is present.
-        is_valid = checks["has_name"] and has_any_contact
+        # ── Retail / E-commerce Filter ──
+        # Reject retail stores, product shops, and e-commerce sites that
+        # do not take client appointment bookings.
+        if not checks["is_not_retail"]:
+            prospect.metadata["is_verified"] = False
+            prospect.metadata["skip_reason"] = "Retail store / e-commerce (not a service provider)"
+            logger.info(
+                f"Skipped (retail): {prospect.business_name} "
+                f"— detected as retail store or e-commerce"
+            )
+            return prospect
+
+        # Mark as verified if name + reachable channel is present.
+        is_valid = checks["has_name"] and checks["has_reachable_channel"]
         prospect.metadata["is_verified"] = is_valid
 
         # ── 3-Step Pre-Qualification Filter ──
@@ -109,6 +156,8 @@ class LeadVerificationAgent:
         )
         return verified
 
+    # ── Contact Channel Checks ──
+
     def _check_name(self, p: RawProspect) -> bool:
         """Business name must exist and be meaningful."""
         name = p.business_name.strip()
@@ -120,23 +169,17 @@ class LeadVerificationAgent:
             return False
         return True
 
-    def _check_contact(self, p: RawProspect) -> bool:
-        """At least one contact method should exist."""
-        return bool(p.email or p.phone or p.website)
-
     def _check_email(self, p: RawProspect) -> bool:
         """Validate email format if present."""
-        if not p.email:
-            return False
-        pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
-        return bool(re.match(pattern, p.email.strip()))
+        return has_valid_email(p.email)
 
-    def _check_phone(self, p: RawProspect) -> bool:
-        """Validate phone format if present."""
-        if not p.phone:
-            return False
-        digits = re.sub(r"[^\d]", "", p.phone)
-        return len(digits) >= 7
+    def _check_whatsapp(self, p: RawProspect) -> bool:
+        """Check if the phone number is WhatsApp-capable (mobile number)."""
+        return is_whatsapp_number(p.phone)
+
+    def _check_reachable_channel(self, p: RawProspect) -> bool:
+        """Check if the prospect has at least one reachable outreach channel."""
+        return has_reachable_channel(p.phone, p.email)
 
     def _check_website(self, p: RawProspect) -> bool:
         """Validate website URL format."""
@@ -155,6 +198,69 @@ class LeadVerificationAgent:
         if freshness == "unknown":
             return True  # Don't disqualify, just lower score later
         return False
+
+    # ── Retail / E-commerce Detection ──
+
+    def _check_not_retail(self, p: RawProspect) -> bool:
+        """
+        Check if the business is NOT a retail store or e-commerce site.
+        Returns True if it's a service provider (acceptable).
+        Returns False if it's retail/e-commerce (should be rejected).
+
+        Only applies to beauty-related categories.
+        """
+        # Only filter beauty categories
+        category = (p.business_category or "").lower()
+        beauty_categories = [
+            "beauty", "cosmetic", "makeup", "salon", "spa",
+            "hairdresser", "hair", "nail", "skincare",
+        ]
+        is_beauty = any(cat in category for cat in beauty_categories)
+
+        # Also check business name for beauty-related terms
+        name_lower = (p.business_name or "").lower()
+        name_is_beauty = any(term in name_lower for term in [
+            "beauty", "cosmetic", "makeup", "salon", "spa",
+            "hair", "nail", "skincare", "institut",
+        ])
+
+        if not is_beauty and not name_is_beauty:
+            return True  # Not a beauty category — skip retail check
+
+        # Check business name against retail keywords
+        for keyword in RETAIL_NAME_KEYWORDS:
+            if keyword in name_lower:
+                logger.debug(
+                    f"Retail detected in name '{p.business_name}': "
+                    f"matched keyword '{keyword}'"
+                )
+                return False
+
+        # Check website URL against retail patterns
+        website_lower = (p.website or "").lower()
+        if website_lower:
+            for pattern in RETAIL_URL_PATTERNS:
+                if pattern in website_lower:
+                    logger.debug(
+                        f"Retail detected in URL '{p.website}': "
+                        f"matched pattern '{pattern}'"
+                    )
+                    return False
+
+        # Check snippet/metadata for retail signals
+        snippet = str(p.metadata.get("snippet", "")).lower()
+        research = (p.business_research or "").lower()
+        combined_text = f"{snippet} {research}"
+
+        for signal in RETAIL_SNIPPET_SIGNALS:
+            if signal in combined_text:
+                logger.debug(
+                    f"Retail detected in text for '{p.business_name}': "
+                    f"matched signal '{signal}'"
+                )
+                return False
+
+        return True
 
     # ── 3-Step Pre-Qualification Filter ──
 
