@@ -28,6 +28,13 @@ class GoogleSearchSource(LeadSource):
     def is_configured(self) -> bool:
         return settings.search.is_configured
 
+    # Countries where we use richer contact-focused queries
+    FOREIGN_MARKETS = frozenset({
+        "usa", "united states", "uk", "united kingdom", "australia",
+        "canada", "uae", "dubai", "singapore", "new zealand",
+        "germany", "france", "netherlands", "ireland",
+    })
+
     def search(
         self,
         country: str,
@@ -40,16 +47,34 @@ class GoogleSearchSource(LeadSource):
             logger.warning("Search API not configured. Skipping.")
             return []
 
-        # Build search queries
-        queries = [
-            f"{category} in {city} {country} contact phone email website",
-            f"{category} {city} {country} business directory",
-        ]
+        is_foreign = country.lower().strip() in self.FOREIGN_MARKETS
+
+        # Build search queries — foreign markets get contact-rich queries
+        # that naturally surface businesses with websites and digital footprints.
+        if is_foreign:
+            queries = [
+                f"{category} in {city} {country} official website book appointment",
+                f"{category} {city} {country} contact phone email booking online",
+                f"best {category} {city} {country} website reviews",
+            ]
+        else:
+            queries = [
+                f"{category} in {city} {country} contact phone email website",
+                f"{category} {city} {country} business directory",
+            ]
 
         all_results: List[RawProspect] = []
 
         for query in queries:
-            results = self._execute_search(query, max_results=max_results // len(queries))
+            budget = max_results // len(queries)
+            results = self._execute_search(query, max_results=budget)
+            # Inject city/country into every prospect so downstream
+            # verification and scoring have proper location context.
+            for p in results:
+                if not p.city:
+                    p.city = city
+                if not p.country:
+                    p.country = country
             all_results.extend(results)
 
         # Dedup by domain

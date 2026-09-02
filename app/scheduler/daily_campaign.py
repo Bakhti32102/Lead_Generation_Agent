@@ -165,6 +165,10 @@ class DailyCampaign:
                 # Generate personalized message
                 message = personalizer.generate_message(p)
 
+                # ── Review Mode: Display full outreach message ──
+                if settings.campaign.review_mode or settings.campaign.dry_run:
+                    self._display_outreach_message(p, message, lead_db_id=db_lead.id)
+
                 # Send outreach
                 result = outreach.send_initial(p, message, db_lead.id)
 
@@ -307,6 +311,58 @@ class DailyCampaign:
 
         except Exception as e:
             logger.error(f"Failed to save lead to Google Sheets: {e}")
+
+    def _display_outreach_message(
+        self, prospect, message: str, lead_db_id: int = 0
+    ) -> None:
+        """Display the full outreach message for human review.
+
+        Prints a clean, readable block showing the email subject,
+        complete body text, and channel for each qualified lead.
+        """
+        from app.integrations.email import email_client
+        from app.integrations.whatsapp import whatsapp_client
+
+        # Determine channel
+        channel = "whatsapp"
+        if prospect.email and email_client.is_configured:
+            channel = "email"
+        elif prospect.phone and whatsapp_client.is_configured:
+            channel = "whatsapp"
+        else:
+            channel = "email"  # default display
+
+        subject = ""
+        if channel == "email":
+            subject = f"Quick question regarding {prospect.business_name}'s client bookings"
+
+        border = "=" * 60
+        thin_border = "-" * 60
+
+        print(f"\n{border}")
+        print(f"  OUTREACH REVIEW — Lead #{lead_db_id}")
+        print(border)
+        print(f"  Business:   {prospect.business_name}")
+        print(f"  Category:   {prospect.business_category}")
+        print(f"  Location:   {prospect.city}, {prospect.country}")
+        print(f"  Score:      {prospect.lead_score}")
+        print(f"  Channel:    {channel.upper()}")
+        if channel == "email":
+            print(f"  To:         {prospect.email}")
+        else:
+            print(f"  To:         {prospect.phone}")
+        print(thin_border)
+
+        if channel == "email" and subject:
+            print(f"  Subject:    {subject}")
+            print(thin_border)
+
+        print(f"  Message:")
+        for line in message.split("\n"):
+            print(f"  {line}")
+
+        print(border)
+        print()
 
     def _generate_report(self, summary: Dict) -> str:
         """Generate and log a daily report."""

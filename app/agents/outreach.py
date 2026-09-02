@@ -148,7 +148,7 @@ class OutreachAgent:
         self, prospect: RawProspect, message: str, lead_db_id: int
     ) -> dict:
         """Send email and track result."""
-        subject = f"AI automation idea for {prospect.business_name}"
+        subject = f"Quick question regarding {prospect.business_name}'s client bookings"
         result = email_client.send(
             to_email=prospect.email,
             subject=subject,
@@ -161,7 +161,7 @@ class OutreachAgent:
                 self.followup_repo.mark_initial_sent(lead_db_id, "email")
             # Update Google Sheets
             self._update_sheets_outreach(
-                prospect, "Email", message, "Sent" if result["status"] != "pending_review" else "Pending Review"
+                prospect, "Email", message, "Sent"
             )
             logger.info(f"Email sent to {prospect.email}")
         else:

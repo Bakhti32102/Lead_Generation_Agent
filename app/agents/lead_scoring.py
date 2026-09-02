@@ -33,18 +33,21 @@ class LeadScoringAgent:
     Uses LocationVerifier for textual evidence location checking.
     """
 
-    # Scoring weights — must sum to 100
+    # Scoring weights — sum to 100 for standard leads.
+    # Bounded sources (OSM, Maps) get +15 source_quality on top,
+    # capped at 100 total.
     WEIGHTS: Dict[str, int] = {
         "relevant_category": 15,
         "location_match": 10,
         "location_verification": 5,
-        "recent_requirement": 25,
+        "recent_requirement": 15,
         "automation_opportunity": 15,
         "has_website": 5,
         "has_email": 10,
         "has_phone": 10,
         "has_demo": 5,
         "strong_evidence": 5,
+        "source_quality": 15,  # Bounded sources (OSM, Maps) bonus
     }
 
     def __init__(self, target_category: str = "", target_country: str = "", target_city: str = ""):
@@ -100,7 +103,12 @@ class LeadScoringAgent:
             if loc_verify.confidence >= 0.6:
                 score += self.WEIGHTS["location_verification"]
 
-        # 4. Recent requirement (+20)
+        # 4. Recent requirement / business listing (+20)
+        # Sources that provide ongoing business listings (OSM, Google Maps,
+        # search results) don't have posting dates but the businesses are
+        # actively listed — award baseline credit so they aren't unfairly
+        # penalized compared to job-posting sources.
+        BUSINESS_LISTING_SOURCES = ("openstreetmap", "google_maps", "google_search")
         if prospect.source in ("linkedin", "public_jobs"):
             freshness = getattr(prospect, "freshness", "") or prospect.metadata.get("freshness", "unknown")
             if freshness == "verified_recent":
@@ -109,6 +117,9 @@ class LeadScoringAgent:
                 score += 15
             elif freshness == "unknown":
                 score += 5  # Partial credit
+        elif prospect.source in BUSINESS_LISTING_SOURCES:
+            # Business listings are inherently current — award baseline credit
+            score += 10
 
         # 5. Automation opportunity (+15)
         problems = prospect.metadata.get("problems_list", [])
@@ -137,6 +148,14 @@ class LeadScoringAgent:
         # 10. Strong business evidence (+5)
         if self._has_strong_evidence(prospect):
             score += self.WEIGHTS["strong_evidence"]
+
+        # 11. Source quality bonus (+15)
+        # Bounded/geographically-constrained sources (OSM, Google Maps)
+        # guarantee the business exists at the target location because
+        # the search itself was limited to that area.
+        BOUNDED_SOURCES = ("openstreetmap", "google_maps")
+        if prospect.source in BOUNDED_SOURCES:
+            score += self.WEIGHTS["source_quality"]
 
         # Cap at 100
         return min(score, 100)

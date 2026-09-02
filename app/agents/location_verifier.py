@@ -58,13 +58,33 @@ class LocationVerifier:
         "saudi arabia": ["saudi arabia", ".sa", "ksa"],
     }
 
+    # Sources that perform bounded/geographically-constrained searches.
+    # Prospects from these sources inherit the target city/country as
+    # implicit evidence because the search itself was limited to that area.
+    BOUNDED_SOURCES = frozenset({"openstreetmap", "google_maps"})
+
     def verify(self, prospect: RawProspect, target_city: str, target_country: str) -> LocationVerification:
         """
         Verify location using all available textual evidence.
         Never invents information — only extracts from existing data.
+
+        For bounded sources (OpenStreetMap, Google Maps) that searched within
+        a specific city boundary, the source itself serves as implicit
+        location evidence — no explicit city name in the address is required.
         """
         target_city_lower = target_city.lower().strip()
         target_country_lower = target_country.lower().strip()
+
+        # For bounded sources, inject target city/country as implicit
+        # evidence when the prospect's own fields are empty.
+        source = (prospect.source or "").lower()
+        if source in self.BOUNDED_SOURCES:
+            if not prospect.city and target_city_lower:
+                prospect.city = target_city.title()
+                prospect.metadata["city_inherited_from_source"] = True
+            if not prospect.country and target_country_lower:
+                prospect.country = target_country.title()
+                prospect.metadata["country_inherited_from_source"] = True
 
         # Check structured fields first (strongest evidence)
         structured_result = self._check_structured_fields(prospect, target_city_lower, target_country_lower)

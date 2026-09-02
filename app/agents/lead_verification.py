@@ -39,9 +39,54 @@ class LeadVerificationAgent:
         prospect.metadata["verification"] = checks
         prospect.metadata["verification_score"] = f"{passed}/{total}"
 
-        # Mark as verified if at least name + some contact info is present
-        is_valid = checks["has_name"] and (checks["has_contact"] or checks["has_website"])
+        # ── Mandatory Contact Check ──
+        # A lead MUST have at least one valid outreach channel
+        # (phone, email, or website) to be considered for outreach.
+        # Dead-end entries with no way to contact are rejected immediately.
+        has_any_contact = (
+            checks["has_valid_phone"]
+            or checks["has_valid_email"]
+            or checks["has_website"]
+        )
+        if not has_any_contact:
+            prospect.metadata["is_verified"] = False
+            prospect.metadata["skip_reason"] = "No contact information available"
+            logger.info(
+                f"Skipped (no contact): {prospect.business_name} "
+                f"— phone, email, and website all missing or invalid"
+            )
+            return prospect
+
+        # Mark as verified if at least name + some contact info is present.
+        is_valid = checks["has_name"] and has_any_contact
         prospect.metadata["is_verified"] = is_valid
+
+        # ── 3-Step Pre-Qualification Filter ──
+        # Always run the automation check for prospects that have a valid
+        # name (even if they lack contact info — bounded sources qualify).
+        # If the business already has a website + website AI chatbot +
+        # WhatsApp AI automation, skip it — there is nothing to sell.
+        if checks["has_name"]:
+            already_automated = self._check_already_automated(prospect)
+            if already_automated["fully_automated"]:
+                prospect.metadata["is_verified"] = False
+                prospect.metadata["skip_reason"] = "Already fully automated"
+                prospect.metadata["automation_check"] = already_automated
+                logger.info(
+                    f"Skipped (already automated): {prospect.business_name} "
+                    f"— has website, AI chatbot, and WhatsApp automation"
+                )
+            else:
+                # Tag what is missing so outreach can customise the pitch
+                prospect.metadata["automation_check"] = already_automated
+                missing = []
+                if not already_automated["has_website"]:
+                    missing.append("website")
+                if not already_automated["has_website_chatbot"]:
+                    missing.append("website AI chatbot")
+                if not already_automated["has_whatsapp_automation"]:
+                    missing.append("WhatsApp AI automation")
+                prospect.metadata["automation_gaps"] = missing
 
         if not is_valid:
             logger.debug(
@@ -110,3 +155,67 @@ class LeadVerificationAgent:
         if freshness == "unknown":
             return True  # Don't disqualify, just lower score later
         return False
+
+    # ── 3-Step Pre-Qualification Filter ──
+
+    @staticmethod
+    def _check_already_automated(prospect: RawProspect) -> dict:
+        """Check whether the business already has a website, AI chatbot,
+        and WhatsApp automation.
+
+        Returns a dict with:
+          has_website            – bool
+          has_website_chatbot    – bool
+          has_whatsapp_automation – bool
+          fully_automated        – bool  (True only when all three are True)
+
+        Detection is best-effort based on available metadata, scraped
+        content, and URL heuristics.  False negatives are acceptable
+        (we prefer to outreach a business that already has a simple bot
+        rather than miss a genuinely un-automated business).
+        """
+        has_website = bool(prospect.website)
+
+        # ── Website chatbot detection ──
+        # Look for common chatbot widget indicators in the website URL,
+        # metadata tags, or scraped snippet text.
+        chatbot_signals = [
+            "tidio", "intercom", "drift", "crisp", "zendesk",
+            "livechat", "olark", "tawk", "freshdesk", "hubspot",
+            "chatbot", "chat-widget", "chat-widget-js",
+            "messenger", "fb Messenger",
+            "widget.tawk", "crisp.chat",
+        ]
+        has_website_chatbot = False
+        if has_website:
+            website_lower = prospect.website.lower()
+            meta_text = str(prospect.metadata).lower()
+            snippet = prospect.metadata.get("snippet", "").lower()
+            research = (prospect.business_research or "").lower()
+            combined = f"{website_lower} {meta_text} {snippet} {research}"
+            has_website_chatbot = any(s in combined for s in chatbot_signals)
+
+        # ── WhatsApp automation detection ──
+        # Look for WhatsApp Business API usage, wa.me links with auto-reply
+        # indicators, or explicit WhatsApp automation mentions.
+        whatsapp_signals = [
+            "whatsapp business api", "whatsapp automation",
+            "whatsapp chatbot", "wa-bot", "whatsapp bot",
+            "business.whatsapp", "api.whatsapp",
+            "wa.me/send", "whatsapp ai",
+        ]
+        has_whatsapp_automation = False
+        meta_text = str(prospect.metadata).lower()
+        snippet = prospect.metadata.get("snippet", "").lower()
+        research = (prospect.business_research or "").lower()
+        combined = f"{meta_text} {snippet} {research}"
+        has_whatsapp_automation = any(s in combined for s in whatsapp_signals)
+
+        fully_automated = has_website and has_website_chatbot and has_whatsapp_automation
+
+        return {
+            "has_website": has_website,
+            "has_website_chatbot": has_website_chatbot,
+            "has_whatsapp_automation": has_whatsapp_automation,
+            "fully_automated": fully_automated,
+        }

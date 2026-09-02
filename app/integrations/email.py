@@ -91,13 +91,38 @@ class EmailClient:
         creds = self._get_gmail_oauth_credentials()
         service = build("gmail", "v1", credentials=creds)
 
+        # Validate sender matches authenticated account (best-effort)
+        # getProfile needs gmail.readonly scope — may not be available.
+        # In that case we proceed with the configured address.
+        authenticated_email = self._get_authenticated_email(service)
+        if authenticated_email:
+            if self.from_address.lower() != authenticated_email.lower():
+                logger.warning(
+                    f"Sender mismatch: from='{self.from_address}' "
+                    f"but authenticated as '{authenticated_email}'. "
+                    f"Using authenticated address to avoid spoofing warning."
+                )
+                self.from_address = authenticated_email
+            else:
+                logger.info(f"Sender validated: {self.from_address}")
+
+        # Build MIME message with proper headers
+        import uuid
+        from email.utils import formatdate, make_msgid
+
         msg = MIMEMultipart("alternative")
         msg["to"] = to_email
-        msg["from"] = self.from_address
+        msg["from"] = f"Muhammad Habib (AI Agent Developer) <{self.from_address}>"
+        msg["sender"] = self.from_address  # Gmail uses this for auth
+        msg["reply-to"] = self.from_address
+        msg["message-id"] = make_msgid(domain="gmail.com")
+        msg["date"] = formatdate(localtime=True)
         msg["subject"] = subject
-        msg.attach(MIMEText(body_text, "plain"))
+        msg["user-agent"] = "LeadGenerationAgent/1.0"
+        msg["mime-version"] = "1.0"
+        msg.attach(MIMEText(body_text, "plain", "utf-8"))
         if body_html:
-            msg.attach(MIMEText(body_html, "html"))
+            msg.attach(MIMEText(body_html, "html", "utf-8"))
 
         raw = urlsafe_b64encode(msg.as_bytes()).decode()
         result = (
@@ -148,6 +173,87 @@ class EmailClient:
             logger.info("Gmail OAuth token refreshed.")
 
         return creds
+
+    @staticmethod
+    def _get_authenticated_email(service) -> str:
+        """Get the email address of the authenticated Gmail account.
+
+        Tries getProfile first (needs gmail.readonly scope).
+        Falls back to extracting from the OAuth token's ID token.
+        Returns empty string on failure (non-fatal).
+        """
+        # Try getProfile (requires gmail.readonly scope)
+        try:
+            profile = service.users().getProfile(userId="me").execute()
+            email = profile.get("emailAddress", "")
+            if email:
+                return email
+        except Exception:
+            pass
+
+        # Fallback: extract from OAuth token ID
+        try:
+            import json
+            from pathlib import Path
+            from google.oauth2.credentials import Credentials
+
+            gmail_token_path = Path(settings.google_sheets.token_path).parent / "gmail_token.json"
+            if gmail_token_path.exists():
+                with open(gmail_token_path) as f:
+                    token_data = json.load(f)
+                # The token file may contain the email in the token itself
+                # or we can decode the access token JWT
+                access_token = token_data.get("token", "")
+                if access_token:
+                    # Decode JWT payload (base64url)
+                    import base64
+                    parts = access_token.split(".")
+                    if len(parts) >= 2:
+                        payload = parts[1]
+                        # Add padding
+                        payload += "=" * (4 - len(payload) % 4)
+                        decoded = json.loads(base64.urlsafe_b64decode(payload))
+                        email = decoded.get("email", "")
+                        if email:
+                            return email
+        except Exception as e:
+            logger.debug(f"Could not extract email from token: {e}")
+
+        return ""
+
+    def validate_sender(self) -> dict:
+        """Validate that configured sender matches authenticated account.
+        Returns {"valid": bool, "configured": str, "authenticated": str, "message": str}."""
+        try:
+            from googleapiclient.discovery import build
+            creds = self._get_gmail_oauth_credentials()
+            service = build("gmail", "v1", credentials=creds)
+            authenticated = self._get_authenticated_email(service)
+            configured = self.from_address
+
+            if not authenticated:
+                return {
+                    "valid": False,
+                    "configured": configured,
+                    "authenticated": "",
+                    "message": "Could not determine authenticated account",
+                }
+
+            match = configured.lower() == authenticated.lower()
+            return {
+                "valid": match,
+                "configured": configured,
+                "authenticated": authenticated,
+                "message": "Sender matches authenticated account" if match
+                    else f"MISMATCH: configured='{configured}' but authenticated='{authenticated}'",
+            }
+        except Exception as e:
+            return {
+                "valid": False,
+                "configured": self.from_address,
+                "authenticated": "",
+                "message": f"Validation failed: {e}",
+            }
 
     def _send_sendgrid(
         self, to_email: str, subject: str, body_text: str, body_html: Optional[str]

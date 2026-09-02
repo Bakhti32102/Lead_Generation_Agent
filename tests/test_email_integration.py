@@ -166,6 +166,7 @@ class TestEmailMocked:
                 with patch("googleapiclient.discovery.build") as mock_build:
                     mock_service = MagicMock()
                     mock_service.users().messages().send().execute.return_value = {"id": "msg_456"}
+                    mock_service.users().getProfile().execute.return_value = {"emailAddress": "test@gmail.com"}
                     mock_build.return_value = mock_service
 
                     result = client.send("recipient@example.com", "Test Subject", "Test body")

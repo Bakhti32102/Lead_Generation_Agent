@@ -90,7 +90,7 @@ class TestMessageGeneration:
         )
 
         message = agent.generate_followup_message(prospect, "3day")
-        assert "following up" in message.lower()
+        assert "circle back" in message.lower()
         assert "Smile Clinic" in message
 
     def test_followup_7day_message(self):
@@ -104,7 +104,7 @@ class TestMessageGeneration:
         )
 
         message = agent.generate_followup_message(prospect, "7day")
-        assert "last follow-up" in message.lower()
+        assert "last note" in message.lower()
         assert "Quick Bites" in message
 
 

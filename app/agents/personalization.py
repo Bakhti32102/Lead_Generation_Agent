@@ -36,42 +36,39 @@ class PersonalizationAgent:
         """Generate a message using LLM."""
         my = settings.my_business
 
-        system_prompt = f"""You are a professional outreach specialist for an AI development business.
-Write a short, personalized outreach message to a business owner.
+        system_prompt = f"""You are a Senior B2B Conversion Copywriter for an AI automation agency.
+Write a short, high-converting outreach email to a business owner.
 
-Rules:
-- Keep it under 200 words
+TONE: Professional, consultative, peer-to-peer. Every sentence must earn its place.
+No florid adjectives, no desperate sales fluff, no buzzwords.
+
+STRUCTURE (follow this EXACTLY):
+1. Opening line: Call out a specific, relatable operational bottleneck for their category
+   (e.g. staff spending hours on repetitive booking calls, missing client queries after hours).
+   Do NOT use generic openers like "I hope this email finds you well".
+2. Brief bridge: One sentence connecting the bottleneck to the cost (lost revenue, wasted staff time).
+3. Value prop (3 short lines, no bullets): Frame the solution as an automatic growth engine:
+   - 24/7 instant WhatsApp responses
+   - Zero missed client leads
+   - Automated calendar scheduling
+4. CTA: Low-friction and conversational.
+   "Open to seeing a quick 2-minute custom demo built for {{business_name}} next week?"
+5. Sign-off:
+   Best regards,
+   {my.name} ({my.description})
+   - Email: {my.email}
+   - WhatsApp: {my.whatsapp_number}
+   - Website: {my.website_url}
+   - Fiverr: {my.fiverr_url}
+   - LinkedIn: {my.linkedin_url}
+
+RULES:
+- Under 150 words
 - Simple professional English
-- Mention the business by name
-- Mention a specific automation opportunity (NOT as a proven fact, but as a potential)
-- Mention the recommended solution briefly
-- Include a relevant demo link if available
-- Keep a natural, non-pushy tone
-- End with a soft call to action
-- Include these links at the end (only include available ones):
-  Website: {my.website_url}
-  Fiverr: {my.fiverr_url}
-  LinkedIn: {my.linkedin_url}
-
-Do NOT use:
-- Excessive AI jargon
-- Long paragraphs
-- Fake urgency or scarcity
-- Guaranteed results claims
-- "Revolutionary" or "10x" language
-- Pressure tactics
-
-The message should communicate: "You know your business best. There may be repetitive work that an AI agent can automate. I've built working systems and can customize one for your business."
-
-Structure:
-1. Personal greeting mentioning the business name
-2. Brief observation about a potential automation opportunity
-3. How the recommended solution could help
-4. Link to a relevant working demo
-5. Soft invitation to discuss
-6. Your links (website, fiverr, linkedin)
-
-Write the message directly. No subject line. No quotes around the message."""
+- Mention the business by name at least once
+- Never claim guaranteed results
+- Never use urgency/scarcity tactics
+- Write the message directly. No subject line. No quotes."""
 
         demo_info = ""
         if prospect.metadata.get("demo_url"):
@@ -126,6 +123,7 @@ Write the personalized outreach message:"""
                 city = settings.campaign.target_city or "your city"
             else:
                 city = "your city"
+        category = prospect.business_category or "business"
         service = prospect.recommended_service or "AI automation"
         solution = prospect.recommended_ai_solution or "AI agent"
 
@@ -136,29 +134,44 @@ Write the personalized outreach message:"""
 
         demo_text = ""
         if prospect.metadata.get("demo_url"):
-            demo_text = f"\n\nI've built a working demo you can check out: {prospect.metadata['demo_url']}"
+            demo_text = f"\n\nYou can see a working demo here: {prospect.metadata['demo_url']}"
 
         links = []
+        if my.name:
+            links.append(my.name)
+        if my.description:
+            links.append(my.description)
+        if my.email:
+            links.append(f"Email: {my.email}")
+        if my.whatsapp_number:
+            links.append(f"WhatsApp: {my.whatsapp_number}")
         if my.website_url:
             links.append(f"Website: {my.website_url}")
         if my.fiverr_url:
             links.append(f"Fiverr: {my.fiverr_url}")
         if my.linkedin_url:
             links.append(f"LinkedIn: {my.linkedin_url}")
-        links_text = "\n\n".join(links)
+        links_text = "\n".join(links)
 
-        message = f"""Hi there,
+        # Build automation-gaps context for the pitch
+        gaps = prospect.metadata.get("automation_gaps", [])
+        gap_text = ""
+        if gaps:
+            gap_text = "\n" + "\n".join(
+                f"  - {g}" for g in gaps
+            )
 
-I came across {name} in {city} and wanted to reach out.
+        message = f"""Hi {name},
 
-If your team handles customer inquiries, appointment requests, or routine questions {problems_text}, this is a workflow that could potentially be automated.
+I noticed your front desk in {city} is likely handling the same booking calls and client questions on repeat — that's hours of staff time that could go toward actual patient care.
 
-I build {solution} systems using AI that can handle these tasks automatically — using your business information and connected tools to manage routine operations and escalate complex cases to your team.{demo_text}
+We build AI assistants that sit on your WhatsApp and website, answering client queries instantly 24/7, filling your calendar automatically, and making sure no lead falls through the cracks after hours.
 
-I'd be happy to show you how it could work for {name} if you're interested. No pressure — just thought it might be worth exploring.
+It's not a big tech overhaul — it's a focused automation layer that runs in the background while your team focuses on what they do best.{demo_text}
 
-{my.name}
-{my.description}
+Open to seeing a quick 2-minute custom demo built for {name} next week?
+
+Best regards,
 
 {links_text}"""
 
@@ -172,24 +185,23 @@ I'd be happy to show you how it could work for {name} if you're interested. No p
         """Generate a follow-up message (3-day or 7-day)."""
         my = settings.my_business
         name = prospect.business_name
+        category = prospect.business_category or "business"
         solution = prospect.recommended_ai_solution or "AI automation"
 
         if followup_type == "3day":
-            message = f"""Hi,
+            message = f"""Hi {name},
 
-Just following up on my previous message about {solution} for {name}.
+Wanted to circle back on the WhatsApp automation idea I mentioned — it's a quick win that eliminates repetitive booking calls and keeps your inbox clear.
 
-I thought this could be useful for your business, especially around your daily customer workflows. I'd be happy to show you a quick example if you're interested.
+Happy to walk you through a 2-minute demo whenever it's convenient.
 
 {my.name}"""
         else:  # 7day
-            message = f"""Hi,
+            message = f"""Hi {name},
 
-Just one last follow-up regarding the {solution} idea I shared for {name}.
+Last note from me — if automating client bookings and after-hours queries is on your radar, I'm happy to show you exactly how it works for a {category} business like yours.
 
-If this is something you're considering, I'd be happy to show you how it could work for your business. If not, no problem at all.
-
-Wishing you all the best!
+Either way, wishing you a strong week ahead.
 
 {my.name}"""
 

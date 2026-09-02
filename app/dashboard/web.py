@@ -2,6 +2,8 @@
 Web Dashboard.
 Flask-based dashboard for monitoring campaigns, viewing leads, and taking actions.
 Accessible via browser at http://localhost:5000
+
+Supports real-time campaign progress via Server-Sent Events (SSE).
 """
 
 from __future__ import annotations
@@ -9,11 +11,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import sys
+import threading
+import time
+import uuid
 from datetime import datetime, date
 from pathlib import Path
-
-from flask import Flask, render_template_string, request, jsonify, redirect, url_for
+from flask import Flask, render_template_string, request, jsonify, redirect, url_for, Response
 
 # Ensure project root is on path
 project_root = Path(__file__).resolve().parent.parent.parent
@@ -29,6 +34,48 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
+# ── SSE Event Bus ──────────────────────────────────────────────────────────
+# Global event bus: maps session_id -> queue of SSE events
+_event_queues: dict[str, queue.Queue] = {}
+_event_lock = threading.Lock()
+_campaign_active: dict[str, bool] = {}
+
+
+def _publish_event(session_id: str, event: dict) -> None:
+    """Publish an event to a specific session's SSE queue."""
+    with _event_lock:
+        q = _event_queues.get(session_id)
+    if q:
+        q.put(event)
+
+
+def _create_session() -> str:
+    """Create a new SSE session and return its ID."""
+    sid = uuid.uuid4().hex[:12]
+    with _event_lock:
+        _event_queues[sid] = queue.Queue()
+        _campaign_active[sid] = False
+    return sid
+
+
+def _cleanup_session(sid: str) -> None:
+    """Remove a session's queue."""
+    with _event_lock:
+        _event_queues.pop(sid, None)
+        _campaign_active.pop(sid, None)
+
+
+def _is_campaign_active(sid: str) -> bool:
+    with _event_lock:
+        return _campaign_active.get(sid, False)
+
+
+def _set_campaign_active(sid: str, active: bool) -> None:
+    with _event_lock:
+        _campaign_active[sid] = active
+
+
+# ── Base Template ──────────────────────────────────────────────────────────
 
 def _base(content: str, title: str, active_page: str) -> str:
     """Render base template with content."""
@@ -66,6 +113,7 @@ def _base(content: str, title: str, active_page: str) -> str:
         .btn-success { background: #27ae60; color: white; }
         .btn-danger { background: #e74c3c; color: white; }
         .btn-warning { background: #f39c12; color: white; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
         .btn-sm { padding: 4px 8px; font-size: 12px; }
         .form-group { margin-bottom: 15px; }
         .form-group label { display: block; margin-bottom: 5px; font-weight: 500; }
@@ -102,6 +150,8 @@ def _base(content: str, title: str, active_page: str) -> str:
         active_page=active_page,
     )
 
+
+# ── Dashboard Routes ───────────────────────────────────────────────────────
 
 @app.route("/")
 def dashboard():
@@ -142,7 +192,7 @@ def dashboard():
 <div class="card">
     <h2>Quick Actions</h2>
     <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-        <a href="/campaign/run" class="btn btn-primary">Run Campaign</a>
+        <a href="/campaign" class="btn btn-primary">Run Campaign</a>
         <a href="/followups/run" class="btn btn-success">Process Follow-ups</a>
         <a href="/leads" class="btn btn-warning">View Leads</a>
         <a href="/config" class="btn">View Config</a>
@@ -320,9 +370,11 @@ def reject_lead(lead_id):
     return redirect(url_for("leads_list"))
 
 
+# ── Campaign Routes (with SSE live streaming) ─────────────────────────────
+
 @app.route("/campaign")
 def campaign_page():
-    """Campaign management page."""
+    """Campaign management page with live terminal UI."""
     init_db()
     campaign_repo = CampaignRepository()
     today_run = campaign_repo.get_today_run()
@@ -341,39 +393,557 @@ def campaign_page():
     </div>"""
 
     content = f"""
+<style>
+    /* ── Live Campaign Styles ── */
+    .campaign-form {{ display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }}
+    .campaign-form .form-group {{ margin-bottom: 0; }}
+    .campaign-form .full-width {{ grid-column: 1 / -1; }}
+
+    /* Stepper */
+    .stepper {{ display: flex; justify-content: space-between; align-items: center; margin: 25px 0; position: relative; }}
+    .stepper::before {{ content: ''; position: absolute; top: 20px; left: 40px; right: 40px; height: 3px; background: #e0e0e0; z-index: 0; }}
+    .stepper .step {{ display: flex; flex-direction: column; align-items: center; z-index: 1; flex: 1; }}
+    .stepper .step-icon {{
+        width: 40px; height: 40px; border-radius: 50%;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 16px; font-weight: bold; color: #999;
+        background: #e0e0e0; transition: all 0.4s ease;
+        border: 3px solid transparent;
+    }}
+    .stepper .step-label {{
+        margin-top: 8px; font-size: 12px; color: #999;
+        text-align: center; font-weight: 500; transition: color 0.3s;
+    }}
+    .stepper .step.active .step-icon {{
+        background: #3498db; color: white;
+        border-color: #3498db;
+        box-shadow: 0 0 0 4px rgba(52,152,219,0.25);
+        animation: pulse 1.5s ease-in-out infinite;
+    }}
+    .stepper .step.active .step-label {{ color: #3498db; font-weight: 700; }}
+    .stepper .step.done .step-icon {{ background: #27ae60; color: white; border-color: #27ae60; }}
+    .stepper .step.done .step-label {{ color: #27ae60; }}
+    .stepper .step.error .step-icon {{ background: #e74c3c; color: white; border-color: #e74c3c; }}
+    .stepper .step.error .step-label {{ color: #e74c3c; }}
+
+    @keyframes pulse {{
+        0%, 100% {{ box-shadow: 0 0 0 4px rgba(52,152,219,0.25); }}
+        50% {{ box-shadow: 0 0 0 8px rgba(52,152,219,0.1); }}
+    }}
+
+    /* Terminal Log Box */
+    .terminal-wrap {{
+        background: #0d1117; border-radius: 10px; overflow: hidden;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.3); margin-top: 20px;
+        display: none;
+    }}
+    .terminal-wrap.visible {{ display: block; }}
+    .terminal-bar {{
+        background: #161b22; padding: 10px 16px;
+        display: flex; align-items: center; gap: 8px;
+        border-bottom: 1px solid #30363d;
+    }}
+    .terminal-dot {{ width: 12px; height: 12px; border-radius: 50%; }}
+    .terminal-dot.red {{ background: #ff5f57; }}
+    .terminal-dot.yellow {{ background: #febc2e; }}
+    .terminal-dot.green {{ background: #28c840; }}
+    .terminal-title {{ color: #8b949e; font-size: 12px; margin-left: 10px; font-family: monospace; }}
+    .terminal-body {{
+        padding: 16px; height: 340px; overflow-y: auto;
+        font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+        font-size: 13px; line-height: 1.6;
+    }}
+    .terminal-body::-webkit-scrollbar {{ width: 6px; }}
+    .terminal-body::-webkit-scrollbar-track {{ background: #0d1117; }}
+    .terminal-body::-webkit-scrollbar-thumb {{ background: #30363d; border-radius: 3px; }}
+    .terminal-line {{ white-space: pre-wrap; word-break: break-word; }}
+    .terminal-line .ts {{ color: #484f58; }}
+    .terminal-line .msg {{ color: #c9d1d9; }}
+    .terminal-line.info .msg {{ color: #58a6ff; }}
+    .terminal-line.success .msg {{ color: #3fb950; }}
+    .terminal-line.warn .msg {{ color: #d29922; }}
+    .terminal-line.error .msg {{ color: #f85149; }}
+    .terminal-line.stage .msg {{ color: #bc8cff; font-weight: bold; }}
+
+    /* Summary Bar */
+    .summary-bar {{
+        display: none; margin-top: 15px; padding: 15px;
+        background: #f0fff4; border: 1px solid #c6f6d5; border-radius: 8px;
+    }}
+    .summary-bar.visible {{ display: block; }}
+    .summary-bar.error {{ background: #fff5f5; border-color: #fed7d7; }}
+    .summary-bar h3 {{ margin-bottom: 10px; }}
+    .summary-bar .stats {{ display: flex; gap: 20px; flex-wrap: wrap; }}
+    .summary-bar .stat {{ text-align: center; padding: 10px 15px; background: white; border-radius: 6px; min-width: 100px; }}
+    .summary-bar .stat .number {{ font-size: 24px; font-weight: bold; color: #27ae60; }}
+    .summary-bar .stat .label {{ font-size: 12px; color: #666; margin-top: 2px; }}
+</style>
+
 <div class="card">
     <h2>Campaign Management</h2>
-    <div style="margin-bottom: 20px;">
+    <div>
         <h3>Run New Campaign</h3>
-        <form action="/campaign/run" method="get">
+        <form id="campaignForm" class="campaign-form" onsubmit="return startCampaign(event)">
             <div class="form-group">
                 <label>Country:</label>
-                <input type="text" name="country" value="{settings.campaign.target_country}">
+                <input type="text" name="country" id="f-country" value="{settings.campaign.target_country}">
             </div>
             <div class="form-group">
                 <label>City:</label>
-                <input type="text" name="city" value="{settings.campaign.target_city}">
+                <input type="text" name="city" id="f-city" value="{settings.campaign.target_city}">
             </div>
             <div class="form-group">
                 <label>Category:</label>
-                <input type="text" name="category" value="{settings.campaign.target_business_category}">
+                <input type="text" name="category" id="f-category" value="{settings.campaign.target_business_category}">
             </div>
             <div class="form-group">
                 <label>Number of Leads:</label>
-                <input type="number" name="count" value="{settings.campaign.daily_lead_target}">
+                <input type="number" name="count" id="f-count" value="{settings.campaign.daily_lead_target}">
             </div>
-            <button type="submit" class="btn btn-primary">Run Campaign</button>
+            <div class="form-group full-width" style="display:flex;gap:10px;align-items:flex-end;">
+                <button type="submit" id="runBtn" class="btn btn-primary" style="padding:10px 30px;">
+                    &#x1f680; Run Campaign
+                </button>
+                <span id="runStatus" style="color:#888;font-size:13px;padding-bottom:10px;"></span>
+            </div>
         </form>
     </div>
-    {run_info}
-</div>"""
+</div>
+
+<!-- Stepper -->
+<div class="stepper" id="stepper" style="display:none;">
+    <div class="step" id="step-discovery" data-step="discovery">
+        <div class="step-icon">1</div>
+        <div class="step-label">Discovery</div>
+    </div>
+    <div class="step" id="step-filtering" data-step="filtering">
+        <div class="step-icon">2</div>
+        <div class="step-label">Filtering</div>
+    </div>
+    <div class="step" id="step-verification" data-step="verification">
+        <div class="step-icon">3</div>
+        <div class="step-label">Verification</div>
+    </div>
+    <div class="step" id="step-research" data-step="research">
+        <div class="step-icon">4</div>
+        <div class="step-label">Research</div>
+    </div>
+    <div class="step" id="step-scoring" data-step="scoring">
+        <div class="step-icon">5</div>
+        <div class="step-label">Scoring</div>
+    </div>
+    <div class="step" id="step-saving" data-step="saving">
+        <div class="step-icon">6</div>
+        <div class="step-label">Saving</div>
+    </div>
+    <div class="step" id="step-complete" data-step="complete">
+        <div class="step-icon">&#10003;</div>
+        <div class="step-label">Complete</div>
+    </div>
+</div>
+
+<!-- Terminal Log -->
+<div class="terminal-wrap" id="terminalWrap">
+    <div class="terminal-bar">
+        <div class="terminal-dot red"></div>
+        <div class="terminal-dot yellow"></div>
+        <div class="terminal-dot green"></div>
+        <span class="terminal-title" id="terminalTitle">campaign &mdash; live</span>
+    </div>
+    <div class="terminal-body" id="terminalBody"></div>
+</div>
+
+<!-- Summary -->
+<div class="summary-bar" id="summaryBar">
+    <h3 id="summaryTitle">Campaign Complete</h3>
+    <div class="stats" id="summaryStats"></div>
+</div>
+
+<script>
+const STEP_ORDER = ['discovery','filtering','verification','research','scoring','saving','complete'];
+let eventSource = null;
+let sessionId = null;
+
+function addTerminalLine(text, cls) {{
+    const body = document.getElementById('terminalBody');
+    const now = new Date().toLocaleTimeString('en-US', {{hour12:false}});
+    const line = document.createElement('div');
+    line.className = 'terminal-line ' + (cls || '');
+    line.innerHTML = '<span class="ts">[' + now + ']</span> <span class="msg">' + text + '</span>';
+    body.appendChild(line);
+    body.scrollTop = body.scrollHeight;
+}}
+
+function setStepActive(stepName) {{
+    STEP_ORDER.forEach(s => {{
+        const el = document.getElementById('step-' + s);
+        if (!el) return;
+        if (s === stepName) {{
+            el.className = 'step active';
+        }} else if (STEP_ORDER.indexOf(s) < STEP_ORDER.indexOf(stepName)) {{
+            el.className = 'step done';
+        }} else {{
+            el.className = 'step';
+        }}
+    }});
+}}
+
+function setStepError(stepName) {{
+    const el = document.getElementById('step-' + stepName);
+    if (el) el.className = 'step error';
+}}
+
+function showSummary(data) {{
+    const bar = document.getElementById('summaryBar');
+    const title = document.getElementById('summaryTitle');
+    const stats = document.getElementById('summaryStats');
+    const isFailed = data.status === 'failed';
+
+    bar.className = 'summary-bar visible' + (isFailed ? ' error' : '');
+    title.textContent = isFailed ? 'Campaign Failed' : 'Campaign Complete';
+
+    stats.innerHTML = [
+        {{ n: data.discovered || 0, l: 'Discovered' }},
+        {{ n: data.qualified || 0, l: 'Qualified' }},
+        {{ n: data.final_leads || 0, l: 'Final Leads' }},
+        {{ n: data.emails_sent || 0, l: 'Emails Sent' }},
+        {{ n: data.whatsapp_sent || 0, l: 'WhatsApp Sent' }},
+    ].map(s => '<div class="stat"><div class="number">' + s.n + '</div><div class="label">' + s.l + '</div></div>').join('');
+}}
+
+function connectSSE(sid) {{
+    if (eventSource) eventSource.close();
+    eventSource = new EventSource('/campaign/stream?sid=' + sid);
+
+    eventSource.onmessage = function(e) {{
+        try {{
+            const data = JSON.parse(e.data);
+            const type = data.type || '';
+
+            if (type === 'log') {{
+                addTerminalLine(data.message, data.level || '');
+            }} else if (type === 'stage') {{
+                setStepActive(data.stage);
+                addTerminalLine('\\u2500\\u2500 ' + (data.label || data.stage) + ' \\u2500\\u2500', 'stage');
+            }} else if (type === 'error') {{
+                addTerminalLine(data.message, 'error');
+            }} else if (type === 'done') {{
+                setStepActive('complete');
+                addTerminalLine('Campaign finished: ' + (data.status || 'completed'), 'success');
+                showSummary(data.summary || {{}});
+                document.getElementById('runBtn').disabled = false;
+                document.getElementById('runBtn').innerHTML = '&#x1f680; Run Campaign';
+                document.getElementById('runStatus').textContent = '';
+                eventSource.close();
+            }} else if (type === 'started') {{
+                document.getElementById('terminalTitle').textContent = data.label || 'campaign \\u2014 live';
+            }}
+        }} catch(err) {{ console.error('SSE parse error', err); }}
+    }};
+
+    eventSource.onerror = function() {{
+        addTerminalLine('Connection lost. Retrying...', 'warn');
+    }};
+}}
+
+function startCampaign(e) {{
+    e.preventDefault();
+
+    const btn = document.getElementById('runBtn');
+    btn.disabled = true;
+    btn.innerHTML = '&#x23f3; Running...';
+    document.getElementById('runStatus').textContent = 'Starting campaign...';
+
+    // Show UI elements
+    document.getElementById('stepper').style.display = 'flex';
+    document.getElementById('terminalWrap').className = 'terminal-wrap visible';
+    document.getElementById('summaryBar').className = 'summary-bar';
+    document.getElementById('terminalBody').innerHTML = '';
+
+    // Reset stepper
+    STEP_ORDER.forEach(s => {{
+        const el = document.getElementById('step-' + s);
+        if (el) el.className = 'step';
+    }});
+
+    const params = new URLSearchParams({{
+        country: document.getElementById('f-country').value,
+        city: document.getElementById('f-city').value,
+        category: document.getElementById('f-category').value,
+        count: document.getElementById('f-count').value,
+    }});
+
+    fetch('/campaign/run-async?' + params.toString(), {{ method: 'POST' }})
+        .then(r => r.json())
+        .then(data => {{
+            sessionId = data.session_id;
+            document.getElementById('runStatus').textContent = 'Connected to live stream';
+            connectSSE(sessionId);
+        }})
+        .catch(err => {{
+            addTerminalLine('Failed to start campaign: ' + err.message, 'error');
+            btn.disabled = false;
+            btn.innerHTML = '&#x1f680; Run Campaign';
+        }});
+
+    return false;
+}}
+</script>
+"""
+
+    content += run_info
 
     return _base(content, "Campaign", "campaign")
 
 
+@app.route("/campaign/run-async", methods=["POST"])
+def run_campaign_async():
+    """Start a campaign in a background thread and return a session ID for SSE streaming."""
+    country = request.args.get("country", settings.campaign.target_country)
+    city = request.args.get("city", settings.campaign.target_city)
+    category = request.args.get("category", settings.campaign.target_business_category)
+    count = int(request.args.get("count", settings.campaign.daily_lead_target))
+
+    sid = _create_session()
+    _set_campaign_active(sid, True)
+
+    def _run():
+        try:
+            _publish_event(sid, {"type": "started", "label": f"Campaign: {category} in {city}, {country}"})
+            _publish_event(sid, {"type": "stage", "stage": "discovery", "label": f"Discovery — {category} in {city}, {country}"})
+            _publish_event(sid, {"type": "log", "message": f"Starting campaign: {category} in {city}, {country} (target: {count})", "level": "info"})
+
+            # ── Step 1: Discovery ──
+            from app.agents.lead_discovery import LeadDiscoveryAgent
+            discovery = LeadDiscoveryAgent()
+
+            _publish_event(sid, {"type": "log", "message": "Searching OpenStreetMap...", "level": "info"})
+            prospects = discovery.discover(
+                country=country,
+                city=city,
+                category=category,
+                max_results=count * 3,
+            )
+            _publish_event(sid, {"type": "log", "message": f"Discovered {len(prospects)} raw prospects", "level": "success"})
+
+            # ── Step 2: Dedup / Filtering ──
+            _publish_event(sid, {"type": "stage", "stage": "filtering", "label": "Filtering & Deduplication"})
+            _publish_event(sid, {"type": "log", "message": f"Running deduplication on {len(prospects)} prospects..."})
+
+            # Dedup happens inside verification, but we show it here
+            seen = set()
+            unique = []
+            for p in prospects:
+                key = (p.business_name or "").lower().strip()
+                if key and key not in seen:
+                    seen.add(key)
+                    unique.append(p)
+            removed = len(prospects) - len(unique)
+            if removed:
+                _publish_event(sid, {"type": "log", "message": f"Removed {removed} duplicates → {len(unique)} unique", "level": "info"})
+            prospects = unique
+
+            _publish_event(sid, {"type": "log", "message": "Running contact availability check..."})
+
+            # ── Step 3: Verification ──
+            _publish_event(sid, {"type": "stage", "stage": "verification", "label": "Location Verification & Qualification"})
+            from app.agents.lead_verification import LeadVerificationAgent
+            verification = LeadVerificationAgent()
+            prospects = verification.verify_batch(prospects)
+            _publish_event(sid, {"type": "log", "message": f"Verified {len(prospects)} leads after contact + location checks", "level": "success"})
+
+            if not prospects:
+                _publish_event(sid, {"type": "log", "message": "No prospects passed verification. Campaign ending.", "level": "warn"})
+                _publish_event(sid, {"type": "done", "status": "completed", "summary": {"discovered": len(unique), "qualified": 0, "final_leads": 0, "emails_sent": 0, "whatsapp_sent": 0}})
+                return
+
+            # ── Step 4: Business Research ──
+            _publish_event(sid, {"type": "stage", "stage": "research", "label": "Business Research & Analysis"})
+            from app.agents.business_research import BusinessResearchAgent
+            research = BusinessResearchAgent()
+            for i, p in enumerate(prospects):
+                try:
+                    _publish_event(sid, {"type": "log", "message": f"Researching: {p.business_name[:50]}..."})
+                    research.research(p)
+                except Exception as e:
+                    _publish_event(sid, {"type": "log", "message": f"Research skipped for {p.business_name[:40]}: {str(e)[:60]}", "level": "warn"})
+
+            # ── Step 5: Problem Analysis ──
+            from app.agents.problem_analysis import ProblemAnalysisAgent
+            problem_agent = ProblemAnalysisAgent()
+            for p in prospects:
+                try:
+                    problem_agent.analyze(p, category)
+                except Exception as e:
+                    pass  # silent
+
+            # ── Step 6: Solution Matching ──
+            from app.agents.solution_matching import SolutionMatchingAgent
+            matching = SolutionMatchingAgent()
+            for p in prospects:
+                try:
+                    matching.match(p)
+                except Exception:
+                    pass
+
+            # ── Step 7: Scoring ──
+            _publish_event(sid, {"type": "stage", "stage": "scoring", "label": "Lead Scoring & Selection"})
+            from app.agents.lead_scoring import LeadScoringAgent
+            scoring = LeadScoringAgent(target_category=category, target_country=country, target_city=city)
+            prospects = scoring.score_batch(prospects)
+            qualified = [p for p in prospects if p.is_qualified]
+            _publish_event(sid, {"type": "log", "message": f"Scored {len(prospects)} prospects → {len(qualified)} qualified (threshold: {settings.campaign.lead_score_threshold})", "level": "success"})
+
+            final_leads = scoring.select_top_leads(prospects, count)
+            _publish_event(sid, {"type": "log", "message": f"Selected top {len(final_leads)} leads for outreach", "level": "info"})
+
+            if not final_leads:
+                _publish_event(sid, {"type": "log", "message": "No leads selected. Campaign ending.", "level": "warn"})
+                _publish_event(sid, {"type": "done", "status": "completed", "summary": {"discovered": len(unique), "qualified": len(qualified), "final_leads": 0, "emails_sent": 0, "whatsapp_sent": 0}})
+                return
+
+            # ── Step 8: Save & Outreach ──
+            _publish_event(sid, {"type": "stage", "stage": "saving", "label": "Saving to Database & Outreach"})
+            from app.agents.personalization import PersonalizationAgent
+            personalizer = PersonalizationAgent()
+            from app.agents.outreach import OutreachAgent
+            outreach_agent = OutreachAgent()
+            from app.database import CampaignRepository, FollowUpRepository, LeadRepository
+            lead_repo = LeadRepository()
+            followup_repo = FollowUpRepository()
+
+            emails_sent = 0
+            whatsapp_sent = 0
+            failed = 0
+
+            for i, p in enumerate(final_leads):
+                _publish_event(sid, {"type": "log", "message": f"[{i+1}/{len(final_leads)}] {p.business_name[:50]} (score: {p.lead_score})"})
+
+                # Save to DB
+                lead_data = {
+                    "business_name": p.business_name,
+                    "business_category": p.business_category or category,
+                    "country": p.country or country,
+                    "city": p.city or city,
+                    "address": p.address,
+                    "phone": p.phone,
+                    "email": p.email,
+                    "website": p.website,
+                    "google_maps_url": p.google_maps_url,
+                    "source": p.source,
+                    "source_url": p.source_url,
+                    "posted_date": p.posted_date,
+                    "business_research": p.business_research,
+                    "potential_problem": p.potential_problem,
+                    "recommended_service": p.recommended_service,
+                    "recommended_ai_solution": p.recommended_ai_solution,
+                    "lead_score": p.lead_score,
+                    "is_qualified": p.is_qualified,
+                    "dedup_website": p.website.lower().strip() if p.website else "",
+                    "dedup_email": p.email.lower().strip() if p.email else "",
+                    "dedup_phone": p.phone.strip() if p.phone else "",
+                    "dedup_maps_url": p.google_maps_url.strip() if p.google_maps_url else "",
+                }
+                db_lead = lead_repo.save_lead(lead_data)
+                followup_repo.create_state(db_lead.id)
+
+                # Generate message
+                message = personalizer.generate_message(p)
+
+                # Send outreach
+                result = outreach_agent.send_initial(p, message, db_lead.id)
+                if result["success"]:
+                    if result["channel"] == "email":
+                        emails_sent += 1
+                        _publish_event(sid, {"type": "log", "message": f"  \u2709 Email sent to {p.email}", "level": "success"})
+                    elif result["channel"] == "whatsapp":
+                        whatsapp_sent += 1
+                        _publish_event(sid, {"type": "log", "message": f"  \U0001f4f1 WhatsApp sent to {p.phone}", "level": "success"})
+                    lead_repo.update_lead(db_lead.id, {"is_outreach_lead": True, "notes": message})
+                else:
+                    failed += 1
+                    _publish_event(sid, {"type": "log", "message": f"  \u2716 Send failed: {result.get('status', 'unknown')}", "level": "error"})
+                    lead_repo.update_lead(db_lead.id, {"is_outreach_lead": True, "notes": f"Not sent: {result.get('status', 'unknown')}"})
+
+            # ── Follow-ups ──
+            from app.agents.follow_up import FollowUpAgent
+            followup_agent = FollowUpAgent()
+            fu_results = followup_agent.process_all_followups()
+
+            _publish_event(sid, {
+                "type": "done",
+                "status": "completed",
+                "summary": {
+                    "discovered": len(unique),
+                    "qualified": len(qualified),
+                    "final_leads": len(final_leads),
+                    "emails_sent": emails_sent,
+                    "whatsapp_sent": whatsapp_sent,
+                },
+            })
+
+        except Exception as e:
+            logger.error(f"Campaign failed: {e}", exc_info=True)
+            _publish_event(sid, {"type": "error", "message": f"Campaign failed: {str(e)[:200]}"})
+            _publish_event(sid, {"type": "done", "status": "failed", "summary": {"discovered": 0, "qualified": 0, "final_leads": 0, "emails_sent": 0, "whatsapp_sent": 0}})
+        finally:
+            _set_campaign_active(sid, False)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    return jsonify({"session_id": sid, "status": "started"})
+
+
+@app.route("/campaign/stream")
+def campaign_stream():
+    """SSE endpoint that streams campaign events for a given session."""
+    sid = request.args.get("sid", "")
+    if not sid or sid not in _event_queues:
+        return "Invalid session", 400
+
+    def generate():
+        q = _event_queues.get(sid)
+        if not q:
+            return
+
+        # Keep alive heartbeat every 15s
+        last_heartbeat = time.time()
+
+        while True:
+            try:
+                evt = q.get(timeout=15)
+                yield f"data: {json.dumps(evt)}\n\n"
+
+                if evt.get("type") == "done":
+                    # Send one final keepalive then stop
+                    time.sleep(1)
+                    _cleanup_session(sid)
+                    break
+
+                last_heartbeat = time.time()
+
+            except queue.Empty:
+                # Send heartbeat to keep connection alive
+                yield f": heartbeat\n\n"
+                if time.time() - last_heartbeat > 120:
+                    _cleanup_session(sid)
+                    break
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.route("/campaign/run")
 def run_campaign():
-    """Run a campaign with parameters."""
+    """Run a campaign synchronously (legacy)."""
     country = request.args.get("country", settings.campaign.target_country)
     city = request.args.get("city", settings.campaign.target_city)
     category = request.args.get("category", settings.campaign.target_business_category)
@@ -418,6 +988,8 @@ def run_campaign():
 
     return _base(content, "Campaign Results", "campaign")
 
+
+# ── Follow-up Routes ───────────────────────────────────────────────────────
 
 @app.route("/followups")
 def followups_page():
@@ -498,6 +1070,8 @@ def run_followups(followup_type="all"):
 
     return _base(content, "Follow-up Results", "followups")
 
+
+# ── Config Route ───────────────────────────────────────────────────────────
 
 @app.route("/config")
 def config_page():

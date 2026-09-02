@@ -53,13 +53,23 @@ class LeadDiscoveryAgent:
         """
         all_prospects: List[RawProspect] = []
 
+        # Foreign markets get more budget to web search (Tavily) since
+        # OSM data is sparser outside Pakistan.  Domestic campaigns lean
+        # heavier on OSM where coverage is strong.
+        FOREIGN_MARKETS = frozenset({
+            "usa", "united states", "uk", "united kingdom", "australia",
+            "canada", "uae", "dubai", "singapore", "new zealand",
+            "germany", "france", "netherlands", "ireland",
+        })
+        is_foreign = country.lower().strip() in FOREIGN_MARKETS
+
         source_map: Dict[str, tuple] = {
             "google_maps": (GoogleMapsSource, search_google_maps),
             "openstreetmap": (OpenStreetMapSource, True),  # Always enabled — free, no API key
             "google_search": (GoogleSearchSource, search_google),
             "linkedin": (LinkedInSource, search_linkedin and search_recent_requirements),
             "public_jobs": (PublicJobSource, search_recent_requirements),
-            "serpapi": (SerpAPISource, search_google),  # SerpAPI used for additional Google/Maps/LinkedIn search
+            "serpapi": (SerpAPISource, search_google),
         }
 
         for source_name, (source_class, enabled) in source_map.items():
@@ -73,31 +83,40 @@ class LeadDiscoveryAgent:
 
             logger.info(f"Searching {source_name} for {category} in {city}, {country}...")
             try:
-                # SerpAPI can search multiple engines
+                # Budget allocation: foreign markets give more to web search
                 if source_name == "serpapi":
                     results = source.search(
-                        country=country,
-                        city=city,
-                        category=category,
-                        max_results=max_results // 3,  # Split budget
+                        country=country, city=city, category=category,
+                        max_results=max_results // 3,
                         search_type="google_maps",
                     )
-                    # Also search LinkedIn via SerpAPI if LinkedIn is enabled
                     if search_linkedin and search_recent_requirements:
                         linkedin_results = source.search(
-                            country=country,
-                            city=city,
-                            category=category,
+                            country=country, city=city, category=category,
                             max_results=max_results // 4,
                             search_type="linkedin",
                         )
                         results.extend(linkedin_results)
+                elif source_name == "google_search":
+                    # Foreign: give web search 60% of budget
+                    # Domestic: give it 40%
+                    budget = int(max_results * (0.6 if is_foreign else 0.4))
+                    results = source.search(
+                        country=country, city=city, category=category,
+                        max_results=budget,
+                    )
+                elif source_name == "openstreetmap":
+                    # Foreign: reduce OSM budget (sparser data)
+                    # Domestic: full budget
+                    budget = max_results if not is_foreign else max_results // 2
+                    results = source.search(
+                        country=country, city=city, category=category,
+                        max_results=budget,
+                    )
                 else:
                     results = source.search(
-                        country=country,
-                        city=city,
-                        category=category,
-                        max_results=max_results // 2 if source_name != "openstreetmap" else max_results,
+                        country=country, city=city, category=category,
+                        max_results=max_results // 2,
                     )
 
                 all_prospects.extend(results)
