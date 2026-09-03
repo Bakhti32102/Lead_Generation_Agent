@@ -10,6 +10,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.sources.base import LeadSource, RawProspect
+from app.utils.categories import normalize_category
 
 logger = logging.getLogger(__name__)
 
@@ -159,16 +160,41 @@ def _build_address(tag: Dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
-def _build_tag_filter(tag_pairs: List[Tuple[str, str]]) -> str:
-    """Build Overpass tag filter string like: ["amenity"="dentist"]"""
-    clauses = []
-    for key, value in tag_pairs:
-        clauses.append(f'["{key}"="{value}"]')
-    return "".join(clauses)
+def _build_tag_filters(tag_pairs: List[Tuple[str, str]]) -> List[str]:
+    """Build Overpass tag filter strings — one per alternative tag pair.
+
+    Each tag pair becomes an independent filter string such as
+    ``["shop"="beauty"]``.  The caller must search for each filter
+    as a *separate* alternative (OR semantics) and merge the results.
+
+    Previously this function concatenated all clauses into a single
+    string (e.g. ``["shop"="beauty"]["shop"="hairdresser"]``), which
+    produced AND semantics and returned zero results for every
+    multi-tag category because a single OSM element cannot satisfy
+    conflicting tag values.
+
+    Returns:
+        A list of single-filter strings.  For a single tag pair the
+        list contains one element; for multiple pairs it contains one
+        element per pair.
+    """
+    return [f'["{key}"="{value}"]' for key, value in tag_pairs]
+
+
+# Strict timeout for Overpass API requests (seconds).
+# Prevents the background campaign thread from hanging on slow Overpass
+# responses — if it takes longer than this, we fall back to Google Search.
+OVERPASS_TIMEOUT = 12
 
 
 def _overpass_post(query: str) -> Optional[Dict]:
-    """Send a query to the Overpass API and return parsed JSON."""
+    """Send a query to the Overpass API and return parsed JSON.
+
+    Uses a strict 12-second timeout to avoid blocking the background
+    campaign thread.  Raises ``requests.exceptions.Timeout`` on timeout
+    and ``requests.exceptions.HTTPError`` on non-2xx responses so the
+    caller can decide whether to fall back.
+    """
     import requests
 
     resp = requests.post(
@@ -178,7 +204,7 @@ def _overpass_post(query: str) -> Optional[Dict]:
             "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": USER_AGENT,
         },
-        timeout=40,
+        timeout=OVERPASS_TIMEOUT,
     )
     resp.raise_for_status()
     return resp.json()
@@ -217,14 +243,19 @@ class OpenStreetMapSource(LeadSource):
         )
 
         tag_pairs = self._resolve_tags(category)
-        tag_filter = _build_tag_filter(tag_pairs)
+        tag_filters = _build_tag_filters(tag_pairs)
+
+        logger.info(
+            f"OpenStreetMap: resolved {len(tag_filters)} tag alternatives "
+            f"for '{category}': {tag_pairs}"
+        )
 
         # Strategy 1: area-based search (respects administrative boundaries)
-        elements = self._search_by_area(city, country, tag_filter)
+        elements = self._search_by_area(city, country, tag_filters)
 
         # Strategy 2: bbox fallback (uses approximate coordinates)
         if not elements and city:
-            elements = self._search_by_bbox(city, tag_filter)
+            elements = self._search_by_bbox(city, tag_filters)
 
         logger.info(f"OpenStreetMap: got {len(elements)} raw elements")
 
@@ -244,9 +275,15 @@ class OpenStreetMapSource(LeadSource):
     # ------------------------------------------------------------------
 
     def _search_by_area(
-        self, city: str, country: str, tag_filter: str
+        self, city: str, country: str, tag_filters: List[str]
     ) -> List[Dict]:
-        """Search using Overpass area syntax (administrative boundaries)."""
+        """Search using Overpass area syntax (administrative boundaries).
+
+        Executes one Overpass query per alternative tag filter and merges
+        results, deduplicating by element ID.  This implements OR semantics
+        so that e.g. a beauty parlour search finds elements tagged with
+        shop=beauty OR shop=hairdresser OR amenity=hairdresser.
+        """
         area_clause = ""
         if city:
             area_clause = f'area["name"="{city}"]["boundary"="administrative"]->.searchArea;'
@@ -255,7 +292,11 @@ class OpenStreetMapSource(LeadSource):
         else:
             return []
 
-        query = f"""
+        seen_ids: set = set()
+        all_elements: List[Dict] = []
+
+        for tag_filter in tag_filters:
+            query = f"""
 [out:json][timeout:25];
 {area_clause}
 (
@@ -264,15 +305,25 @@ class OpenStreetMapSource(LeadSource):
 );
 out center body;
 """
-        try:
-            data = _overpass_post(query)
-            return data.get("elements", []) if data else []
-        except Exception as e:
-            logger.debug(f"OSM area search failed: {e}")
-            return []
+            try:
+                data = _overpass_post(query)
+                elements = data.get("elements", []) if data else []
+                for elem in elements:
+                    eid = elem.get("id")
+                    if eid and eid not in seen_ids:
+                        seen_ids.add(eid)
+                        all_elements.append(elem)
+            except Exception as e:
+                logger.debug(f"OSM area search failed for filter {tag_filter}: {e}")
 
-    def _search_by_bbox(self, city: str, tag_filter: str) -> List[Dict]:
-        """Search using an approximate bounding box for the city."""
+        return all_elements
+
+    def _search_by_bbox(self, city: str, tag_filters: List[str]) -> List[Dict]:
+        """Search using an approximate bounding box for the city.
+
+        Executes one Overpass query per alternative tag filter and merges
+        results, deduplicating by element ID.
+        """
         bbox = CITY_BBOXES.get(city.lower().strip())
         if not bbox:
             logger.info(
@@ -282,7 +333,11 @@ out center body;
             return []
 
         south, west, north, east = bbox
-        query = f"""
+        seen_ids: set = set()
+        all_elements: List[Dict] = []
+
+        for tag_filter in tag_filters:
+            query = f"""
 [out:json][timeout:25];
 (
   node{tag_filter}({south},{west},{north},{east});
@@ -290,12 +345,18 @@ out center body;
 );
 out center body;
 """
-        try:
-            data = _overpass_post(query)
-            return data.get("elements", []) if data else []
-        except Exception as e:
-            logger.debug(f"OSM bbox search failed: {e}")
-            return []
+            try:
+                data = _overpass_post(query)
+                elements = data.get("elements", []) if data else []
+                for elem in elements:
+                    eid = elem.get("id")
+                    if eid and eid not in seen_ids:
+                        seen_ids.add(eid)
+                        all_elements.append(elem)
+            except Exception as e:
+                logger.debug(f"OSM bbox search failed for filter {tag_filter}: {e}")
+
+        return all_elements
 
     # ------------------------------------------------------------------
     # Tag resolution
@@ -304,11 +365,16 @@ out center body;
     @staticmethod
     def _resolve_tags(category: str) -> List[Tuple[str, str]]:
         """Map a business category string to OSM tag pairs."""
+        # Normalize category typos before lookup
+        normalized = normalize_category(category).lower().strip()
+        if normalized in CATEGORY_TAG_MAP:
+            return CATEGORY_TAG_MAP[normalized]
+        # Also try the original lower-cased form
         lower = category.lower().strip()
         if lower in CATEGORY_TAG_MAP:
             return CATEGORY_TAG_MAP[lower]
         # Fallback: treat as amenity type
-        return [("amenity", lower)]
+        return [("amenity", normalized)]
 
     # ------------------------------------------------------------------
     # Element → RawProspect
