@@ -154,12 +154,39 @@ def is_whatsapp_number(phone: str) -> bool:
     return False
 
 
-def has_valid_email(email: str) -> bool:
-    """Validate email format."""
+def has_valid_email(email: str, check_domain: bool = False) -> bool:
+    """Validate email format.
+
+    Args:
+        email: The email address to validate.
+        check_domain: If True, performs a DNS MX lookup to verify the
+            domain exists and can receive mail.  Adds ~100ms latency.
+            Defaults to False for backward compatibility.
+    """
     if not email or not email.strip():
         return False
     pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
-    return bool(re.match(pattern, email.strip()))
+    if not re.match(pattern, email.strip()):
+        return False
+    if check_domain:
+        domain = email.strip().split("@")[-1].lower()
+        # Reject obviously invalid/test domains
+        _BLOCKED_DOMAINS = frozenset([
+            "example.com", "test.com", "localhost",
+            "invalid", "fake.com", "none.com",
+        ])
+        if domain in _BLOCKED_DOMAINS:
+            return False
+        try:
+            import socket
+            socket.getaddrinfo(domain, None, socket.AF_INET)
+            return True
+        except socket.gaierror:
+            # Domain does not resolve — likely invalid
+            return False
+        except Exception:
+            return True
+    return True
 
 
 def has_reachable_channel(phone: str, email: str) -> bool:

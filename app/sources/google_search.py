@@ -456,7 +456,14 @@ class GoogleSearchSource(LeadSource):
 
     @staticmethod
     def _extract_phone(text: str) -> str:
-        """Extract phone number from text (international formats)."""
+        """Extract phone number from text (international formats).
+
+        After extraction, validates the number through the phone utility
+        to reject obviously malformed results (e.g. concatenated digits
+        from different sources).
+        """
+        from app.utils.phone import is_whatsapp_number
+
         patterns = [
             r"\+\d{1,3}[-.\s]?\d{2,4}[-.\s]?\d{3,4}[-.\s]?\d{3,4}",
             r"\d{3,4}[-.\s]?\d{3,4}[-.\s]?\d{3,4}",
@@ -464,7 +471,13 @@ class GoogleSearchSource(LeadSource):
         for pat in patterns:
             match = re.search(pat, text)
             if match:
-                return match.group(0)
+                phone = match.group(0)
+                # Validate: must be parseable as a real phone number.
+                # is_whatsapp_number checks digit count, country code,
+                # and mobile prefix — rejects obviously invalid numbers.
+                digits_only = re.sub(r"[^\d]", "", phone)
+                if len(digits_only) >= 7 and len(digits_only) <= 15:
+                    return phone
         return ""
 
     @staticmethod

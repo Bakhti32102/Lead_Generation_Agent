@@ -84,17 +84,24 @@ class LeadScoringAgent:
         return prospects
 
     def score(self, prospect: RawProspect) -> int:
-        """Calculate a 0-100 score for a prospect."""
+        """Calculate a 0-100 score for a prospect.
+
+        The breakdown is stored in ``prospect.metadata["score_breakdown"]``
+        as a dict of ``{factor: points}`` so that every score is explainable.
+        """
         score = 0
+        breakdown: Dict[str, int] = {}
 
         # 1. Relevant business category (+15)
         if self._category_match(prospect):
             score += self.WEIGHTS["relevant_category"]
+            breakdown["relevant_category"] = self.WEIGHTS["relevant_category"]
 
         # 2. Location match (+10)
         # Use structured fields OR textual evidence
         if self._location_match(prospect):
             score += self.WEIGHTS["location_match"]
+            breakdown["location_match"] = self.WEIGHTS["location_match"]
 
         # 3. Location verification bonus (+5)
         # Awarded when textual evidence confirms target city/country
@@ -102,6 +109,7 @@ class LeadScoringAgent:
         if loc_verify and loc_verify.state in ("verified", "probably_verified"):
             if loc_verify.confidence >= 0.6:
                 score += self.WEIGHTS["location_verification"]
+                breakdown["location_verification"] = self.WEIGHTS["location_verification"]
 
         # 4. Recent requirement / business listing (+20)
         # Sources that provide ongoing business listings (OSM, Google Maps,
@@ -113,41 +121,52 @@ class LeadScoringAgent:
             freshness = getattr(prospect, "freshness", "") or prospect.metadata.get("freshness", "unknown")
             if freshness == "verified_recent":
                 score += 25
+                breakdown["recent_requirement"] = 25
             elif freshness == "probably_recent":
                 score += 15
+                breakdown["recent_requirement"] = 15
             elif freshness == "unknown":
                 score += 5  # Partial credit
+                breakdown["recent_requirement"] = 5
         elif prospect.source in BUSINESS_LISTING_SOURCES:
             # Business listings are inherently current — award baseline credit
             score += 10
+            breakdown["business_listing"] = 10
 
         # 5. Automation opportunity (+15)
         problems = prospect.metadata.get("problems_list", [])
         if problems and len(problems) >= 2:
             score += 15
+            breakdown["automation_opportunity"] = 15
         elif problems:
             score += 8
+            breakdown["automation_opportunity"] = 8
 
         # 6. Business website available (+5)
         if prospect.website:
             score += self.WEIGHTS["has_website"]
+            breakdown["has_website"] = self.WEIGHTS["has_website"]
 
         # 7. Business email available (+10)
         if prospect.email:
             score += self.WEIGHTS["has_email"]
+            breakdown["has_email"] = self.WEIGHTS["has_email"]
 
         # 8. Business WhatsApp / Phone available (+10)
         has_whatsapp = prospect.metadata.get("has_whatsapp", False)
         if has_whatsapp or prospect.phone:
             score += self.WEIGHTS["has_phone"]
+            breakdown["has_phone"] = self.WEIGHTS["has_phone"]
 
         # 9. Relevant demo available (+5)
         if prospect.metadata.get("demo_url"):
             score += self.WEIGHTS["has_demo"]
+            breakdown["has_demo"] = self.WEIGHTS["has_demo"]
 
         # 10. Strong business evidence (+5)
         if self._has_strong_evidence(prospect):
             score += self.WEIGHTS["strong_evidence"]
+            breakdown["strong_evidence"] = self.WEIGHTS["strong_evidence"]
 
         # 11. Source quality bonus (+15)
         # Bounded/geographically-constrained sources (OSM, Google Maps)
@@ -156,9 +175,17 @@ class LeadScoringAgent:
         BOUNDED_SOURCES = ("openstreetmap", "google_maps")
         if prospect.source in BOUNDED_SOURCES:
             score += self.WEIGHTS["source_quality"]
+            breakdown["source_quality"] = self.WEIGHTS["source_quality"]
 
         # Cap at 100
-        return min(score, 100)
+        final_score = min(score, 100)
+
+        # Store breakdown for explainability
+        breakdown["_raw_total"] = score
+        breakdown["_final"] = final_score
+        prospect.metadata["score_breakdown"] = breakdown
+
+        return final_score
 
     def score_batch(self, prospects: List[RawProspect]) -> List[RawProspect]:
         """Score a batch and sort by score descending.

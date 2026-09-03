@@ -222,6 +222,14 @@ class LeadDiscoveryAgent:
                 name=p.business_name,
             )
             if existing is not None:
+                # Cross-campaign protection: if this business was already
+                # contacted in a previous campaign, skip it to avoid
+                # duplicate outreach.
+                if existing.is_outreach_lead:
+                    logger.info(
+                        f"Skipping '{p.business_name[:50]}' — "
+                        f"already contacted (lead #{existing.id})"
+                    )
                 continue
 
             # Dedup within this batch
