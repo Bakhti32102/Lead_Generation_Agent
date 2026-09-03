@@ -77,6 +77,7 @@ class LeadDiscoveryAgent:
         }
 
         osm_prospect_count = 0  # Track OSM results for fallback decision
+        osm_failed = False       # Track if OSM search failed (timeout/error)
 
         for source_name, (source_class, enabled) in source_map.items():
             if not enabled:
@@ -103,7 +104,7 @@ class LeadDiscoveryAgent:
                             max_results=max_results // 4,
                             search_type="linkedin",
                         )
-                        results.extend(linkin_results)
+                        results.extend(linkedin_results)
                 elif source_name == "google_search":
                     # Foreign: give web search 60% of budget
                     # Domestic: give it 40%
@@ -131,6 +132,8 @@ class LeadDiscoveryAgent:
                 logger.info(f"[Discovery]   -> {source_name}: found {len(results)} prospects")
             except Exception as e:
                 logger.error(f"[Discovery]   -> {source_name} FAILED: {type(e).__name__}: {e}")
+                if source_name == "openstreetmap":
+                    osm_failed = True
 
         # ── Automatic Google Search fallback for OSM ──
         # If OpenStreetMap returned 0 raw prospects (empty results or timeout),
@@ -138,10 +141,16 @@ class LeadDiscoveryAgent:
         # to ensure we still have a chance of finding leads. The fallback
         # prospects go through the same dedup, retail filter, and verification
         # pipeline as all other sources.
-        if osm_prospect_count == 0:
+        # Trigger fallback if OSM returned 0 prospects OR failed entirely
+        if osm_prospect_count == 0 or osm_failed:
+            reason = (
+                f"OSM FAILED ({type(None).__name__})"
+                if osm_failed
+                else f"OSM returned 0 prospects"
+            )
             logger.warning(
-                f"[Discovery] OSM returned 0 prospects for '{category}' in {city}, {country}. "
-                "Executing Google Search fallback..."
+                f"[Discovery] {reason} for '{category}' in {city}, {country}. "
+                f"Triggering Google Search fallback..."
             )
             try:
                 fallback_source = GoogleSearchSource()

@@ -295,6 +295,7 @@ class OpenStreetMapSource(LeadSource):
         seen_ids: set = set()
         all_elements: List[Dict] = []
 
+        failed_queries = 0
         for tag_filter in tag_filters:
             query = f"""
 [out:json][timeout:25];
@@ -314,7 +315,17 @@ out center body;
                         seen_ids.add(eid)
                         all_elements.append(elem)
             except Exception as e:
-                logger.debug(f"OSM area search failed for filter {tag_filter}: {e}")
+                failed_queries += 1
+                logger.warning(
+                    f"[OSM] Area search FAILED for filter {tag_filter}: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+        if failed_queries == len(tag_filters) and tag_filters:
+            logger.error(
+                f"[OSM] ALL {failed_queries} area queries failed. "
+                f"Overpass API may be rate-limited or unreachable."
+            )
 
         return all_elements
 
@@ -336,6 +347,7 @@ out center body;
         seen_ids: set = set()
         all_elements: List[Dict] = []
 
+        failed_queries = 0
         for tag_filter in tag_filters:
             query = f"""
 [out:json][timeout:25];
@@ -354,7 +366,17 @@ out center body;
                         seen_ids.add(eid)
                         all_elements.append(elem)
             except Exception as e:
-                logger.debug(f"OSM bbox search failed for filter {tag_filter}: {e}")
+                failed_queries += 1
+                logger.warning(
+                    f"[OSM] Bbox search FAILED for filter {tag_filter}: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+        if failed_queries == len(tag_filters) and tag_filters:
+            logger.error(
+                f"[OSM] ALL {failed_queries} bbox queries failed. "
+                f"Overpass API may be rate-limited or unreachable."
+            )
 
         return all_elements
 
