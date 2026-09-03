@@ -894,17 +894,23 @@ def run_campaign_async():
 
                 # Generate message
                 message = personalizer.generate_message(p)
+                msg_source = p.metadata.get("message_source", "unknown")
 
                 # Send outreach
                 result = outreach_agent.send_initial(p, message, db_lead.id)
                 if result["success"]:
+                    channel_label = result["channel"].capitalize()
                     if result["channel"] == "email":
                         emails_sent += 1
-                        _publish_event(sid, {"type": "log", "message": f"  \u2709 Email sent to {p.email}", "level": "success"})
+                        _publish_event(sid, {"type": "log", "message": f"  \u2709 {channel_label} sent to {p.email}", "level": "success"})
                     elif result["channel"] == "whatsapp":
                         whatsapp_sent += 1
-                        _publish_event(sid, {"type": "log", "message": f"  \U0001f4f1 WhatsApp sent to {p.phone}", "level": "success"})
-                    lead_repo.update_lead(db_lead.id, {"is_outreach_lead": True, "notes": message})
+                        _publish_event(sid, {"type": "log", "message": f"  \U0001f4f1 {channel_label} sent to {p.phone}", "level": "success"})
+                    else:
+                        _publish_event(sid, {"type": "log", "message": f"  \u2714 {channel_label} prepared for {p.business_name}", "level": "success"})
+                    # Record message source (llm vs template) for observability
+                    notes = f"[{msg_source}] {message}" if msg_source != "unknown" else message
+                    lead_repo.update_lead(db_lead.id, {"is_outreach_lead": True, "notes": notes})
                 else:
                     failed += 1
                     _publish_event(sid, {"type": "log", "message": f"  \u2716 Send failed: {result.get('status', 'unknown')}", "level": "error"})

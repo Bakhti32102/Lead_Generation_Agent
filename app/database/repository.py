@@ -6,9 +6,12 @@ Provides clean interfaces for CRUD, dedup, counters, and follow-up state.
 from __future__ import annotations
 
 import datetime as _dt
+import logging
 from typing import List, Optional
 
 from sqlalchemy import and_
+
+logger = logging.getLogger(__name__)
 
 from app.database.models import (
     CampaignRun,
@@ -24,20 +27,24 @@ class LeadRepository:
 
     # ---- Create ----
 
+    MAX_LEADS = 300  # FIFO cap — oldest records deleted when exceeded
+
     def save_lead(self, lead_data: dict) -> DiscoveredLead:
-        """Insert a new discovered lead and return it."""
+        """Insert a new discovered lead, enforce FIFO cap, and return it."""
         session = get_session()
         try:
             lead = DiscoveredLead(**lead_data)
             session.add(lead)
             session.commit()
             session.refresh(lead)
-            return lead
         except Exception:
             session.rollback()
             raise
         finally:
             session.close()
+        # Enforce FIFO cap after commit so the new lead is counted
+        self.enforce_fifo_cap()
+        return lead
 
     def save_leads_batch(self, leads_data: List[dict]) -> List[DiscoveredLead]:
         """Bulk insert leads. Returns list of created leads."""
@@ -214,6 +221,131 @@ class LeadRepository:
         finally:
             session.close()
 
+    # ---- FIFO Cap ----
+
+    def enforce_fifo_cap(self) -> int:
+        """Delete oldest leads when total exceeds MAX_LEADS.
+
+        IMPORTANT: Leads with active follow-up states are preserved to
+        avoid "Lead not found for follow-up state" errors during
+        follow-up processing.  Only leads whose follow-up state is
+        completed, stopped, or nonexistent are eligible for FIFO deletion.
+
+        Returns number deleted.
+        """
+        session = get_session()
+        try:
+            total = session.query(DiscoveredLead).count()
+            if total <= self.MAX_LEADS:
+                return 0
+
+            excess = total - self.MAX_LEADS
+
+            # Build a set of lead IDs that have ACTIVE follow-up states.
+            # Active = overall_status is 'active' (not stopped/completed).
+            active_fu_lead_ids = set(
+                row[0] for row in (
+                    session.query(FollowUpState.lead_id)
+                    .filter(FollowUpState.overall_status == "active")
+                    .all()
+                )
+            )
+
+            # Also protect leads marked as outreach leads (is_outreach_lead=True)
+            # that have active follow-ups — these are the ones the follow-up
+            # agent will try to process.
+
+            # Get oldest leads, skipping protected ones
+            oldest = (
+                session.query(DiscoveredLead)
+                .order_by(DiscoveredLead.id.asc())
+                .all()
+            )
+            deleted = 0
+            for lead in oldest:
+                if deleted >= excess:
+                    break
+                # Skip leads with active follow-up states
+                if lead.id in active_fu_lead_ids:
+                    continue
+                # Clean up any non-active follow-up state
+                fu = session.query(FollowUpState).filter_by(lead_id=lead.id).first()
+                if fu:
+                    session.delete(fu)
+                session.delete(lead)
+                deleted += 1
+            session.commit()
+            if deleted:
+                logger.info(f"FIFO cap: deleted {deleted} oldest leads (cap={self.MAX_LEADS})")
+            return deleted
+        except Exception:
+            session.rollback()
+            return 0
+        finally:
+            session.close()
+
+    def was_previously_contacted(self, email: str = "", website: str = "") -> bool:
+        """Check if a lead with this email or website domain was already emailed
+        in any past campaign (is_outreach_lead=True with notes containing 'Email sent').
+        """
+        session = get_session()
+        try:
+            from sqlalchemy import or_
+
+            filters = [
+                DiscoveredLead.is_outreach_lead == True,
+                DiscoveredLead.notes.ilike("%Email sent%"),
+            ]
+
+            match_filters = []
+            if email and email.strip():
+                match_filters.append(
+                    DiscoveredLead.dedup_email == email.lower().strip()
+                )
+            if website and website.strip():
+                # Match on domain (strip protocol and path)
+                domain = website.lower().strip()
+                for prefix in ["https://", "http://", "www."]:
+                    if domain.startswith(prefix):
+                        domain = domain[len(prefix):]
+                domain = domain.split("/")[0].split("?")[0]
+                if domain:
+                    match_filters.append(
+                        DiscoveredLead.dedup_website.ilike(f"%{domain}%")
+                    )
+
+            if not match_filters:
+                return False
+
+            result = (
+                session.query(DiscoveredLead)
+                .filter(and_(*filters, or_(*match_filters)))
+                .first()
+            )
+            return result is not None
+        except Exception:
+            return False
+        finally:
+            session.close()
+
+    # ---- Delete ----
+
+    def delete_lead(self, lead_id: int) -> bool:
+        """Delete a lead by ID. Returns True if deleted."""
+        session = get_session()
+        try:
+            lead = session.query(DiscoveredLead).filter_by(id=lead_id).first()
+            if lead:
+                session.delete(lead)
+                session.commit()
+                return True
+            return False
+        except Exception:
+            session.rollback()
+            return False
+        finally:
+            session.close()
+
 
 class FollowUpRepository:
     """Handles follow-up state tracking."""
@@ -241,6 +373,22 @@ class FollowUpRepository:
         session = get_session()
         try:
             return session.query(FollowUpState).filter_by(lead_id=lead_id).first()
+        finally:
+            session.close()
+
+    def delete_by_lead_id(self, lead_id: int) -> bool:
+        """Delete follow-up state by lead ID. Returns True if deleted."""
+        session = get_session()
+        try:
+            state = session.query(FollowUpState).filter_by(lead_id=lead_id).first()
+            if state:
+                session.delete(state)
+                session.commit()
+                return True
+            return False
+        except Exception:
+            session.rollback()
+            return False
         finally:
             session.close()
 

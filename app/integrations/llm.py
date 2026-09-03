@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+import random
 from typing import Any, Dict, List, Optional
 
 from app.config.settings import settings
@@ -57,30 +59,94 @@ class LLMClient:
     def is_configured(self) -> bool:
         return bool(self.api_key) and self._client is not None
 
+    # Maximum number of retries for transient 429 / rate-limit errors.
+    # Bounded to avoid hammering the provider.  Each retry doubles the
+    # base delay plus jitter, so total wait is well under 60 seconds.
+    MAX_RETRIES = 3
+
     def chat(
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: int = 1500,
     ) -> str:
-        """Send chat messages and return the assistant response text."""
+        """Send chat messages and return the assistant response text.
+
+        Retries up to MAX_RETRIES times on rate-limit (429) errors with
+        bounded exponential backoff and jitter.  Other errors propagate
+        immediately.
+        """
         if not self.is_configured:
             raise RuntimeError("LLM client is not configured. Check LLM_API_KEY.")
 
-        try:
-            if self.provider in ("openai",):
-                return self._chat_openai(messages, temperature, max_tokens)
-            elif self.provider in ("anthropic",):
-                return self._chat_anthropic(messages, temperature, max_tokens)
-            elif self.provider in ("gemini", "google", "google-generativeai"):
-                return self._chat_gemini(messages, temperature, max_tokens)
-            elif self.provider in ("groq",):
-                return self._chat_groq(messages, temperature, max_tokens)
-            else:
-                raise ValueError(f"Unsupported provider: {self.provider}")
-        except Exception as e:
-            logger.error(f"LLM call failed ({self.provider}/{self.model}): {e}")
-            raise
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.MAX_RETRIES + 1):
+            try:
+                if self.provider in ("openai",):
+                    return self._chat_openai(messages, temperature, max_tokens)
+                elif self.provider in ("anthropic",):
+                    return self._chat_anthropic(messages, temperature, max_tokens)
+                elif self.provider in ("gemini", "google", "google-generativeai"):
+                    return self._chat_gemini(messages, temperature, max_tokens)
+                elif self.provider in ("groq",):
+                    return self._chat_groq(messages, temperature, max_tokens)
+                else:
+                    raise ValueError(f"Unsupported provider: {self.provider}")
+            except Exception as e:
+                last_exc = e
+                if self._is_rate_limit(e) and attempt < self.MAX_RETRIES:
+                    delay = self._backoff_delay(attempt, e)
+                    logger.warning(
+                        f"LLM rate limit ({self.provider}/{self.model}), "
+                        f"attempt {attempt + 1}/{self.MAX_RETRIES}, "
+                        f"retrying in {delay:.1f}s..."
+                    )
+                    time.sleep(delay)
+                    continue
+                # Non-retryable error or retries exhausted
+                logger.error(f"LLM call failed ({self.provider}/{self.model}): {e}")
+                raise
+        # Should not reach here, but safety:
+        raise last_exc  # type: ignore[misc]
+
+    @staticmethod
+    def _is_rate_limit(exc: Exception) -> bool:
+        """Check whether an exception represents a rate-limit (429) error."""
+        msg = str(exc).lower()
+        # Groq 429: "Rate limit reached"
+        # OpenAI 429: "rate_limit_exceeded" or "429"
+        # Anthropic 429: "rate_limit_error"
+        # Generic: "429", "too many requests", "rate limit"
+        return (
+            "429" in msg
+            or "rate limit" in msg
+            or "too many requests" in msg
+            or "rate_limit" in msg
+            or "tpm" in msg
+        )
+
+    @staticmethod
+    def _backoff_delay(attempt: int, exc: Exception) -> float:
+        """Compute bounded exponential backoff delay with jitter.
+
+        Base delay doubles each attempt: 2s, 4s, 8s.
+        Jitter adds ±25% randomization to avoid thundering herd.
+        Capped at 30s total.
+        """
+        base = 2 ** (attempt + 1)  # 2, 4, 8
+        jitter = base * 0.25 * (2 * random.random() - 1)  # ±25%
+        delay = min(base + jitter, 30.0)
+
+        # If the provider specifies a retry-after, honour it
+        msg = str(exc).lower()
+        # Groq sometimes includes: "Please retry after X seconds"
+        import re
+        match = re.search(r"retry after (\d+\.?\d*)", msg)
+        if match:
+            provider_delay = float(match.group(1))
+            delay = min(max(delay, provider_delay), 30.0)
+
+        return delay
 
     def generate(
         self,
@@ -141,6 +207,8 @@ class LLMClient:
         raise ValueError(f"Could not parse JSON from LLM response: {text[:200]}...")
 
     # ---- Provider-specific implementations ----
+    # These raise raw provider exceptions.  The retry logic in chat()
+    # catches 429 / rate-limit errors and retries with backoff.
 
     def _chat_openai(
         self, messages: List[Dict], temperature: float, max_tokens: int
