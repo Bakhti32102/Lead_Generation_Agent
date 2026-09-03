@@ -65,12 +65,20 @@ class LocationVerifier:
 
     def verify(self, prospect: RawProspect, target_city: str, target_country: str) -> LocationVerification:
         """
-        Verify location using all available textual evidence.
+        Verify location using all available evidence.
         Never invents information — only extracts from existing data.
+
+        Checks are applied in priority order:
+        1. Coordinate bounds — reject if lat/lon is far from the target city
+        2. Structured fields — city/country match on prospect metadata
+        3. Textual evidence — snippet, URL, address analysis
 
         For bounded sources (OpenStreetMap, Google Maps) that searched within
         a specific city boundary, the source itself serves as implicit
         location evidence — no explicit city name in the address is required.
+        However, Overpass area searches can return elements from other cities
+        that share the same name (e.g. Melbourne, Florida for a Melbourne,
+        Australia search), so coordinate bounds are the first line of defense.
         """
         target_city_lower = target_city.lower().strip()
         target_country_lower = target_country.lower().strip()
@@ -86,7 +94,16 @@ class LocationVerifier:
                 prospect.country = target_country.title()
                 prospect.metadata["country_inherited_from_source"] = True
 
-        # Check structured fields first (strongest evidence)
+        # ── Step 1: Coordinate bounds check (highest priority) ──
+        # Reject prospects whose actual coordinates are far from the target
+        # city.  This catches false positives from Overpass area searches
+        # that return elements from cities sharing the same name (e.g.
+        # Melbourne, FL for a Melbourne, AU search).
+        coord_result = self._check_coordinate_bounds(prospect, target_city_lower, target_country_lower)
+        if coord_result and coord_result.state == "mismatch":
+            return coord_result
+
+        # ── Step 2: Structured fields check ──
         structured_result = self._check_structured_fields(prospect, target_city_lower, target_country_lower)
         if structured_result and structured_result.state in ("verified", "mismatch"):
             return structured_result
@@ -171,6 +188,100 @@ class LocationVerifier:
                 found_country=found_country,
                 evidence_source=evidence,
                 confidence=0.8,
+            )
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Coordinate bounds validation
+    # ------------------------------------------------------------------
+
+    # Approximate bounding boxes for known cities (south, west, north, east).
+    # Used to reject prospects whose coordinates are clearly outside the
+    # target city.  Only cities with known OSM bbox data are included.
+    _CITY_COORD_BOUNDS: dict[str, tuple[float, float, float, float]] = {
+        # ── Pakistan ──
+        "lahore": (31.30, 74.05, 31.65, 74.55),
+        "karachi": (24.75, 66.90, 25.10, 67.30),
+        "islamabad": (33.55, 72.95, 33.85, 73.30),
+        # ── Australia ──
+        "melbourne": (-38.00, 144.70, -37.65, 145.10),
+        "sydney": (-34.00, 151.00, -33.70, 151.40),
+        "brisbane": (-27.60, 152.90, -27.35, 153.20),
+        "perth": (-32.10, 115.60, -31.80, 115.95),
+        "adelaide": (-35.05, 138.60, -34.80, 138.90),
+        # ── USA ──
+        "new york": (40.50, -74.25, 40.90, -73.70),
+        "los angeles": (33.70, -118.50, 34.35, -117.90),
+        "chicago": (41.60, -87.90, 42.10, -87.50),
+        # ── UK ──
+        "london": (51.30, -0.50, 51.70, 0.30),
+        "manchester": (53.40, -2.35, 53.55, -2.15),
+        # ── Middle East ──
+        "dubai": (25.00, 55.10, 25.40, 55.40),
+    }
+
+    # Maximum allowed distance (in degrees) from the city bbox edge.
+    # A 0.5-degree buffer (~55 km) accommodates suburbs and nearby towns
+    # that are legitimately part of the metropolitan area.
+    _COORD_BUFFER_DEGREES: float = 0.5
+
+    def _check_coordinate_bounds(
+        self,
+        prospect: RawProspect,
+        target_city: str,
+        target_country: str,
+    ) -> LocationVerification | None:
+        """Reject prospects whose coordinates are clearly outside the target city.
+
+        Returns a ``mismatch`` verification if the prospect's lat/lon falls
+        outside the known bounding box for the target city (with a generous
+        buffer for suburbs).  Returns ``None`` if coordinates are missing,
+        not numeric, or the city has no known bounds.
+        """
+        lat = prospect.metadata.get("lat")
+        lon = prospect.metadata.get("lon")
+
+        # Skip if coordinates are missing or zero (unset)
+        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+            return None
+        if lat == 0 and lon == 0:
+            return None
+
+        bounds = self._CITY_COORD_BOUNDS.get(target_city)
+        if not bounds:
+            # No bounds defined for this city — cannot validate
+            return None
+
+        south, west, north, east = bounds
+        buf = self._COORD_BUFFER_DEGREES
+
+        if lat < (south - buf) or lat > (north + buf):
+            return LocationVerification(
+                state="mismatch",
+                target_city=target_city,
+                target_country=target_country,
+                found_city="",
+                found_country="",
+                evidence_source=(
+                    f"coordinates outside target city: "
+                    f"lat={lat:.4f} not in [{south - buf:.2f}, {north + buf:.2f}]"
+                ),
+                confidence=0.98,
+            )
+
+        if lon < (west - buf) or lon > (east + buf):
+            return LocationVerification(
+                state="mismatch",
+                target_city=target_city,
+                target_country=target_country,
+                found_city="",
+                found_country="",
+                evidence_source=(
+                    f"coordinates outside target city: "
+                    f"lon={lon:.4f} not in [{west - buf:.2f}, {east + buf:.2f}]"
+                ),
+                confidence=0.98,
             )
 
         return None
