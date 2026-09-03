@@ -226,16 +226,15 @@ class TestFallbackOnZeroResults:
     """When OSM returns 0, discovery should continue to fallback sources."""
 
     @patch("app.sources.osm._overpass_post", side_effect=Exception("timeout"))
-    def test_osm_exception_does_not_crash(self, mock_post):
-        """OSM timeout should not crash the search."""
+    def test_osm_total_failure_raises(self, mock_post):
+        """When ALL Overpass queries fail, search() raises so the caller
+        (discovery) can set osm_failed=True and trigger fallback."""
         source = OpenStreetMapSource()
-        prospects = source.search(
-            country="Australia", city="Melbourne",
-            category="beauty parlour", max_results=20,
-        )
-        # Should return empty, not crash
-        assert isinstance(prospects, list)
-        assert len(prospects) == 0
+        with pytest.raises(Exception, match="timeout"):
+            source.search(
+                country="Australia", city="Melbourne",
+                category="beauty parlour", max_results=20,
+            )
 
     @patch("app.sources.osm._overpass_post", return_value={"elements": []})
     def test_osm_empty_returns_empty_list(self, mock_post):

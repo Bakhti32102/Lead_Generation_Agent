@@ -251,11 +251,29 @@ class OpenStreetMapSource(LeadSource):
         )
 
         # Strategy 1: area-based search (respects administrative boundaries)
-        elements = self._search_by_area(city, country, tag_filters)
+        try:
+            elements = self._search_by_area(city, country, tag_filters)
+        except Exception as e:
+            # Area search completely failed (ALL queries failed).
+            # Try bbox fallback before giving up.
+            logger.warning(
+                f"[OSM] Area search failed ({type(e).__name__}: {e}). "
+                f"Attempting bbox fallback..."
+            )
+            elements = []
 
         # Strategy 2: bbox fallback (uses approximate coordinates)
         if not elements and city:
-            elements = self._search_by_bbox(city, tag_filters)
+            try:
+                elements = self._search_by_bbox(city, tag_filters)
+            except Exception as e:
+                # Both area and bbox failed completely.
+                # Raise so caller (discovery) can trigger Google Search fallback.
+                logger.error(
+                    f"[OSM] Bbox fallback also failed ({type(e).__name__}: {e}). "
+                    f"No OSM results available."
+                )
+                raise
 
         logger.info(f"OpenStreetMap: got {len(elements)} raw elements")
 
@@ -296,6 +314,7 @@ class OpenStreetMapSource(LeadSource):
         all_elements: List[Dict] = []
 
         failed_queries = 0
+        last_exception: Optional[Exception] = None
         for tag_filter in tag_filters:
             query = f"""
 [out:json][timeout:25];
@@ -316,16 +335,21 @@ out center body;
                         all_elements.append(elem)
             except Exception as e:
                 failed_queries += 1
+                last_exception = e
                 logger.warning(
                     f"[OSM] Area search FAILED for filter {tag_filter}: "
                     f"{type(e).__name__}: {e}"
                 )
 
         if failed_queries == len(tag_filters) and tag_filters:
+            # ALL queries failed — propagate so caller can trigger fallback.
+            # If we silently return [], the caller cannot distinguish
+            # "legitimate zero results" from "Overpass unreachable".
             logger.error(
                 f"[OSM] ALL {failed_queries} area queries failed. "
                 f"Overpass API may be rate-limited or unreachable."
             )
+            raise last_exception  # type: ignore[misc]
 
         return all_elements
 
@@ -348,6 +372,7 @@ out center body;
         all_elements: List[Dict] = []
 
         failed_queries = 0
+        last_exception: Optional[Exception] = None
         for tag_filter in tag_filters:
             query = f"""
 [out:json][timeout:25];
@@ -367,16 +392,19 @@ out center body;
                         all_elements.append(elem)
             except Exception as e:
                 failed_queries += 1
+                last_exception = e
                 logger.warning(
                     f"[OSM] Bbox search FAILED for filter {tag_filter}: "
                     f"{type(e).__name__}: {e}"
                 )
 
         if failed_queries == len(tag_filters) and tag_filters:
+            # ALL queries failed — propagate so caller can trigger fallback.
             logger.error(
                 f"[OSM] ALL {failed_queries} bbox queries failed. "
                 f"Overpass API may be rate-limited or unreachable."
             )
+            raise last_exception  # type: ignore[misc]
 
         return all_elements
 

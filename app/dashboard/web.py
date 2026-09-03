@@ -563,6 +563,8 @@ def campaign_page():
 const STEP_ORDER = ['discovery','filtering','verification','research','scoring','saving','complete'];
 let eventSource = null;
 let sessionId = null;
+let sseConnected = false;
+let sseRetryCount = 0;
 
 function addTerminalLine(text, cls) {{
     const body = document.getElementById('terminalBody');
@@ -613,7 +615,14 @@ function showSummary(data) {{
 
 function connectSSE(sid) {{
     if (eventSource) eventSource.close();
+    sseConnected = false;
+    sseRetryCount = 0;
     eventSource = new EventSource('/campaign/stream?sid=' + sid);
+
+    eventSource.onopen = function() {{
+        sseConnected = true;
+        sseRetryCount = 0;
+    }};
 
     eventSource.onmessage = function(e) {{
         try {{
@@ -642,7 +651,18 @@ function connectSSE(sid) {{
     }};
 
     eventSource.onerror = function() {{
-        addTerminalLine('Connection lost. Retrying...', 'warn');
+        // EventSource auto-reconnects; suppress transient disconnect warnings.
+        // Only show a message if we were previously connected (real drop)
+        // and only after a few retries to avoid spam during normal reconnects.
+        if (sseConnected) {{
+            sseRetryCount++;
+            if (sseRetryCount <= 2) {{
+                addTerminalLine('Reconnecting to stream...', 'info');
+            }} else if (sseRetryCount === 3) {{
+                addTerminalLine('Still reconnecting... proxy may be buffering.', 'warn');
+            }}
+            sseConnected = false;
+        }}
     }};
 }}
 
@@ -717,14 +737,39 @@ def run_campaign_async():
             from app.agents.lead_discovery import LeadDiscoveryAgent
             discovery = LeadDiscoveryAgent()
 
-            _publish_event(sid, {"type": "log", "message": "Searching OpenStreetMap...", "level": "info"})
+            # Attach a temporary log handler that streams discovery/
+            # source log messages to the SSE client so the user can
+            # see exactly which sources are running, whether fallback
+            # triggers, and why.  Filtered to app.agents / app.sources
+            # modules only — no secrets or internal debug noise.
+            import logging as _log_mod
+            _sse_handler_added = False
+
+            class _SSELogHandler(_log_mod.Handler):
+                def __init__(self, session_id: str):
+                    super().__init__()
+                    self._sid = session_id
+
+                def emit(self, record: _log_mod.LogRecord) -> None:
+                    if record.name.startswith(("app.agents", "app.sources")):
+                        _publish_event(self._sid, {
+                            "type": "log",
+                            "message": record.getMessage(),
+                            "level": record.levelname.lower(),
+                        })
+
+            _sse_handler = _SSELogHandler(sid)
+            _sse_handler.setLevel(_log_mod.INFO)
+            _log_mod.getLogger().addHandler(_sse_handler)
+            _sse_handler_added = True
+
             prospects = discovery.discover(
                 country=country,
                 city=city,
                 category=category,
                 max_results=count * 3,
             )
-            _publish_event(sid, {"type": "log", "message": f"Discovered {len(prospects)} raw prospects", "level": "success"})
+            _publish_event(sid, {"type": "log", "message": f"Discovery complete: {len(prospects)} prospects from all sources", "level": "success"})
 
             # ── Step 2: Dedup / Filtering ──
             _publish_event(sid, {"type": "stage", "stage": "filtering", "label": "Filtering & Deduplication"})
@@ -887,6 +932,9 @@ def run_campaign_async():
             _publish_event(sid, {"type": "error", "message": f"Campaign failed: {str(e)[:200]}"})
             _publish_event(sid, {"type": "done", "status": "failed", "summary": {"discovered": 0, "qualified": 0, "final_leads": 0, "emails_sent": 0, "whatsapp_sent": 0}})
         finally:
+            # Remove the temporary SSE log handler
+            if _sse_handler_added:
+                _log_mod.getLogger().removeHandler(_sse_handler)
             _set_campaign_active(sid, False)
 
     t = threading.Thread(target=_run, daemon=True)
@@ -1117,6 +1165,541 @@ def config_page():
 </div>"""
 
     return _base(content, "Configuration", "config")
+
+
+# ── Interactive Review & Selective Dispatch ────────────────────────────────
+
+@app.route("/review")
+def review_page():
+    """Interactive lead review page with checkboxes for selective dispatch."""
+    init_db()
+    lead_repo = LeadRepository()
+    all_leads = lead_repo.get_all_qualified()
+
+    # Show leads that haven't been emailed yet in THIS session (no 'Email sent' in notes)
+    pending = [
+        l for l in all_leads
+        if not (l.notes and "Email sent" in str(l.notes))
+    ]
+
+    # Check historical outreach (past campaigns)
+    already_contacted_count = 0
+    for lead in pending:
+        lead._already_contacted = lead_repo.was_previously_contacted(
+            email=lead.email or "",
+            website=lead.website or "",
+        )
+        if lead._already_contacted:
+            already_contacted_count += 1
+
+    # Group by category for display
+    categories = {}
+    for lead in pending:
+        cat = lead.business_category or "Uncategorized"
+        categories.setdefault(cat, []).append(lead)
+
+    # Pre-generate email previews for leads with email
+    from app.agents.personalization import PersonalizationAgent
+    from app.sources.base import RawProspect
+    personalizer = PersonalizationAgent()
+    email_previews = {}  # lead_id -> {subject, body_preview}
+    for lead in pending:
+        if lead.email and lead.email not in ("N/A", ""):
+            try:
+                prospect = RawProspect(
+                    business_name=lead.business_name or '',
+                    business_category=lead.business_category or '',
+                    country=lead.country or '',
+                    city=lead.city or '',
+                    email=lead.email,
+                    website=lead.website or '',
+                    business_research=lead.business_research or '',
+                    potential_problem=lead.potential_problem or '',
+                    recommended_service=lead.recommended_service or '',
+                    recommended_ai_solution=lead.recommended_ai_solution or '',
+                    source=lead.source or '',
+                    metadata={'lead_id': lead.id},
+                )
+                msg = personalizer.generate_message(prospect)
+                if isinstance(msg, dict):
+                    email_previews[lead.id] = {
+                        'subject': msg.get('subject', f"Quick question regarding {lead.business_name}'s client bookings"),
+                        'body': msg.get('body', ''),
+                    }
+                else:
+                    email_previews[lead.id] = {
+                        'subject': f"Quick question regarding {lead.business_name}'s client bookings",
+                        'body': str(msg),
+                    }
+            except Exception:
+                email_previews[lead.id] = {
+                    'subject': f"Quick question regarding {lead.business_name}'s client bookings",
+                    'body': '(Message generation failed — template fallback would be used)',
+                }
+
+    lead_cards = ""
+    for cat, cat_leads in sorted(categories.items()):
+        lead_cards += f'<h3 class="category-header">{cat} ({len(cat_leads)})</h3>'
+        for lead in cat_leads:
+            was_contacted = getattr(lead, '_already_contacted', False)
+            status_class = "status-sent" if lead.is_outreach_lead else ("status-pending" if lead.is_qualified else "status-draft")
+            status_text = "Outreach" if lead.is_outreach_lead else ("Qualified" if lead.is_qualified else "New")
+            has_email = bool(lead.email and lead.email not in ("N/A", ""))
+            has_phone = bool(lead.phone and lead.phone not in ("N/A", ""))
+
+            email_color = '#27ae60' if has_email else '#e74c3c'
+            phone_color = '#27ae60' if has_phone else '#e74c3c'
+
+            # Grayed-out styling for previously contacted leads
+            card_opacity = '0.55' if was_contacted else '1'
+            card_bg = '#f0f0f0' if was_contacted else 'white'
+            card_border = '1px solid #ddd' if not was_contacted else '1px solid #ccc'
+            checked_attr = '' if was_contacted else ('checked' if has_email else '')
+            disabled_attr = 'disabled' if was_contacted else ''
+            name_color = '#999' if was_contacted else '#1a1a2e'
+
+            # Badge for already-contacted
+            contact_badge = ''
+            if was_contacted:
+                contact_badge = '<span class="status-badge status-sent" style="margin-left:8px;font-size:11px;">Email was Sent</span>'
+
+            # Email preview for right column
+            preview = email_previews.get(lead.id, {})
+            preview_subject = preview.get('subject', '(No email configured)')
+            preview_body = preview.get('body', '(No email configured)')
+            # Truncate body for display but keep readable
+            preview_body_short = preview_body[:600] + ('...' if len(preview_body) > 600 else '')
+            # Escape HTML for safe rendering
+            import html as _html
+            preview_body_escaped = _html.escape(preview_body_short)
+            preview_subject_escaped = _html.escape(preview_subject)
+
+            # Format body with line breaks for display
+            preview_body_formatted = preview_body_escaped.replace('\n', '<br>')
+
+            lead_cards += f"""
+<div class="review-card" style="opacity:{card_opacity};background:{card_bg};border:{card_border};">
+    <!-- LEFT: Lead Information + Checkbox -->
+    <div class="review-col review-col-left">
+        <div class="review-checkbox-row">
+            <input type="checkbox" name="lead_ids" value="{lead.id}" class="lead-cb"
+                   {checked_attr} {disabled_attr} style="width:18px;height:18px;cursor:{'not-allowed' if was_contacted else 'pointer'};">
+            <span class="review-id">#{lead.id}</span>
+        </div>
+        <h4 class="review-biz-name" style="color:{name_color};">{lead.business_name} {contact_badge}</h4>
+        <div class="review-meta">
+            <span class="review-badge">{lead.business_category or 'N/A'}</span>
+            <span class="review-score">Score: {lead.lead_score}</span>
+        </div>
+        <div class="review-detail"><strong>City:</strong> {lead.city or 'N/A'}, {lead.country or ''}</div>
+        <div class="review-detail"><strong>Phone:</strong> <span style="color:{phone_color};">{lead.phone or 'N/A'}</span></div>
+        <div class="review-detail"><strong>Email:</strong> <span style="color:{email_color};">{lead.email or 'N/A'}</span></div>
+        <div class="review-detail"><strong>Website:</strong> {(lead.website or 'N/A')[:45]}</div>
+        <div class="review-detail"><strong>Source:</strong> {lead.source or 'N/A'}</div>
+        <div class="review-status"><span class="status-badge {status_class}">{status_text}</span></div>
+    </div>
+
+    <!-- MIDDLE: Problems & Analysis -->
+    <div class="review-col review-col-mid">
+        <div class="review-section-title">Problems &amp; Analysis</div>
+        <div class="review-problem">
+            <div class="review-problem-label">Identified Issues</div>
+            <div class="review-problem-text">{(lead.potential_problem or 'N/A')[:200]}</div>
+        </div>
+        <div class="review-problem">
+            <div class="review-problem-label">Recommended Service</div>
+            <div class="review-problem-text" style="font-weight:600;color:#2c3e50;">{lead.recommended_service or 'N/A'}</div>
+        </div>
+        <div class="review-problem">
+            <div class="review-problem-label">AI Solution</div>
+            <div class="review-problem-text">{(lead.recommended_ai_solution or 'N/A')[:200]}</div>
+        </div>
+    </div>
+
+    <!-- RIGHT: Email Preview -->
+    <div class="review-col review-col-right">
+        <div class="review-section-title">Outbound Email Preview</div>
+        {'<div class="review-email-preview"><div class="review-email-subject"><strong>Subject:</strong> ' + preview_subject_escaped + '</div><div class="review-email-body">' + preview_body_formatted + '</div></div>' if has_email else '<div class="review-no-email">No email configured for this lead</div>'}
+    </div>
+</div>"""
+
+    if not pending:
+        lead_cards = "<p>No pending leads to review. Run a campaign first.</p>"
+
+    content = f"""
+<style>
+    .review-header {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:15px; }}
+    .review-actions {{ display:flex; gap:10px; flex-wrap:wrap; }}
+    .btn-send {{ background:#27ae60; color:white; padding:10px 24px; font-size:15px; font-weight:600; }}
+    .btn-purge {{ background:#e74c3c; color:white; padding:10px 24px; font-size:15px; }}
+    .btn-select-all {{ background:#3498db; color:white; padding:8px 16px; font-size:13px; }}
+    .review-result {{ margin-top:20px; padding:15px; border-radius:8px; display:none; }}
+    .review-result.ok {{ display:block; background:#d4edda; border:1px solid #c3e6cb; }}
+    .review-result.err {{ display:block; background:#f8d7da; border:1px solid #f5c6cb; }}
+    #reviewLog {{ font-family:monospace; font-size:13px; white-space:pre-wrap; max-height:300px; overflow-y:auto; padding:10px; background:#f8f9fa; border-radius:4px; margin-top:10px; }}
+
+    /* Category headers */
+    .category-header {{ margin:25px 0 12px; color:#2c3e50; font-size:16px; border-bottom:2px solid #3498db; padding-bottom:6px; }}
+
+    /* 3-column lead card */
+    .review-card {{
+        display:grid;
+        grid-template-columns:260px 1fr 1fr;
+        gap:0;
+        border-radius:10px;
+        margin-bottom:12px;
+        overflow:hidden;
+        box-shadow:0 1px 4px rgba(0,0,0,0.08);
+        transition:opacity 0.2s;
+    }}
+    .review-col {{ padding:16px 18px; }}
+    .review-col-left {{
+        border-right:1px solid #eee;
+        display:flex;
+        flex-direction:column;
+        gap:6px;
+    }}
+    .review-col-mid {{
+        border-right:1px solid #eee;
+        display:flex;
+        flex-direction:column;
+        gap:8px;
+    }}
+    .review-col-right {{
+        display:flex;
+        flex-direction:column;
+        gap:8px;
+    }}
+
+    /* Left column elements */
+    .review-checkbox-row {{ display:flex; align-items:center; gap:10px; margin-bottom:4px; }}
+    .review-id {{ font-size:12px; color:#888; font-weight:600; }}
+    .review-biz-name {{ margin:0; font-size:14px; line-height:1.3; }}
+    .review-meta {{ display:flex; gap:8px; align-items:center; margin:2px 0; }}
+    .review-badge {{ background:#e8f4fd; color:#2980b9; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }}
+    .review-score {{ font-size:12px; color:#666; font-weight:600; }}
+    .review-detail {{ font-size:12px; color:#444; line-height:1.5; }}
+    .review-status {{ margin-top:4px; }}
+
+    /* Middle column */
+    .review-section-title {{ font-size:12px; font-weight:700; color:#2c3e50; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px; }}
+    .review-problem {{ background:#f8f9fa; border-radius:6px; padding:8px 10px; }}
+    .review-problem-label {{ font-size:10px; color:#888; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:2px; }}
+    .review-problem-text {{ font-size:12px; color:#333; line-height:1.4; }}
+
+    /* Right column - email preview */
+    .review-email-preview {{ background:#fafbfc; border:1px solid #e8e8e8; border-radius:6px; padding:10px 12px; flex:1; overflow-y:auto; max-height:200px; }}
+    .review-email-subject {{ font-size:12px; color:#2c3e50; margin-bottom:8px; padding-bottom:6px; border-bottom:1px solid #eee; }}
+    .review-email-body {{ font-size:11px; color:#444; line-height:1.5; white-space:pre-wrap; word-break:break-word; }}
+    .review-no-email {{ font-size:12px; color:#999; font-style:italic; padding:20px; text-align:center; }}
+
+    /* Responsive */
+    @media (max-width:1100px) {{
+        .review-card {{ grid-template-columns:1fr; }}
+        .review-col-left, .review-col-mid {{ border-right:none; border-bottom:1px solid #eee; }}
+    }}
+</style>
+
+<div class="card">
+    <div class="review-header">
+        <h2>Lead Review &amp; Dispatch ({len(pending)} pending{', ' + str(already_contacted_count) + ' already contacted' if already_contacted_count else ''})</h2>
+        <div class="review-actions">
+            <button class="btn btn-select-all" onclick="toggleAll()">Select / Deselect All</button>
+            <button class="btn btn-send" id="sendBtn" onclick="sendSelected()">\u2709 Send Selected Emails</button>
+            <button class="btn btn-purge" onclick="purgeUnselected()">\U0001f5d1 Purge Unselected</button>
+        </div>
+    </div>
+    <p style="color:#666;font-size:13px;">Leads with email are pre-checked. Uncheck leads you want to skip. Grayed-out leads were already contacted in past campaigns and cannot be re-selected.</p>
+</div>
+
+<div id="reviewResult" class="review-result"><pre id="reviewLog"></pre></div>
+
+<form id="reviewForm">
+{lead_cards}
+</form>
+
+<script>
+function getSelectedIds() {{
+    return Array.from(document.querySelectorAll('.lead-cb:checked')).map(cb => cb.value);
+}}
+
+function toggleAll() {{
+    const cbs = document.querySelectorAll('.lead-cb');
+    const allChecked = Array.from(cbs).every(cb => cb.checked);
+    cbs.forEach(cb => cb.checked = !allChecked);
+}}
+
+function sendSelected() {{
+    const ids = getSelectedIds();
+    if (ids.length === 0) {{ alert('Select at least one lead.'); return; }}
+    if (!confirm('Send emails to ' + ids.length + ' selected lead(s)?')) return;
+
+    const btn = document.getElementById('sendBtn');
+    btn.disabled = true; btn.innerHTML = '\u23f3 Sending...';
+
+    fetch('/review/send', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{lead_ids: ids}})
+    }})
+    .then(r => r.json())
+    .then(data => {{
+        const el = document.getElementById('reviewResult');
+        el.className = 'review-result ok';
+        document.getElementById('reviewLog').textContent = data.log || JSON.stringify(data, null, 2);
+        btn.innerHTML = '\u2705 Done (' + (data.sent || 0) + ' sent)';
+        // Remove sent leads from the page
+        ids.forEach(id => {{
+            const cb = document.querySelector('.lead-cb[value="' + id + '"]');
+            if (cb) cb.closest('.card').remove();
+        }});
+    }})
+    .catch(err => {{
+        const el = document.getElementById('reviewResult');
+        el.className = 'review-result err';
+        document.getElementById('reviewLog').textContent = 'Error: ' + err.message;
+        btn.disabled = false; btn.innerHTML = '\u2709 Send Selected Emails';
+    }});
+}}
+
+function purgeUnselected() {{
+    const allIds = Array.from(document.querySelectorAll('.lead-cb')).map(cb => cb.value);
+    const selectedIds = getSelectedIds();
+    const unselectedIds = allIds.filter(id => !selectedIds.includes(id));
+    if (unselectedIds.length === 0) {{ alert('No unselected leads to purge.'); return; }}
+    if (!confirm('Permanently delete ' + unselectedIds.length + ' unselected lead(s) from the database?')) return;
+
+    fetch('/review/cleanup', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{purge_ids: unselectedIds}})
+    }})
+    .then(r => r.json())
+    .then(data => {{
+        const el = document.getElementById('reviewResult');
+        el.className = 'review-result ok';
+        document.getElementById('reviewLog').textContent = data.log || JSON.stringify(data, null, 2);
+        unselectedIds.forEach(id => {{
+            const cb = document.querySelector('.lead-cb[value="' + id + '"]');
+            if (cb) cb.closest('.card').remove();
+        }});
+    }})
+    .catch(err => {{
+        const el = document.getElementById('reviewResult');
+        el.className = 'review-result err';
+        document.getElementById('reviewLog').textContent = 'Error: ' + err.message;
+    }});
+}}
+</script>
+"""
+
+    return _base(content, "Lead Review", "review")
+
+
+@app.route("/review/send", methods=["POST"])
+def review_send():
+    """Send emails only to selected leads, archive to Google Sheets by category."""
+    from datetime import datetime as _dt
+    from app.integrations.email import email_client
+    from app.agents.personalization import PersonalizationAgent
+    from app.integrations.google_sheets import sheets_client
+
+    data = request.get_json() or {}
+    lead_ids = data.get("lead_ids", [])
+
+    if not lead_ids:
+        return jsonify({"success": False, "log": "No leads selected", "sent": 0})
+
+    init_db()
+    lead_repo = LeadRepository()
+    personalizer = PersonalizationAgent()
+    from app.sources.base import RawProspect
+
+    log_lines = []
+    sent_count = 0
+    failed_count = 0
+    archived_count = 0
+
+    log_lines.append(f"\u2500" * 50)
+    log_lines.append(f"Selective Dispatch: {len(lead_ids)} lead(s) selected")
+    log_lines.append(f"\u2500" * 50)
+
+    for lid in lead_ids:
+        try:
+            lid_int = int(lid)
+        except (ValueError, TypeError):
+            continue
+
+        lead = lead_repo.get_lead(lid_int)
+        if not lead:
+            log_lines.append(f"[{lid}] Lead not found — skipped")
+            continue
+
+        if not lead.email or lead.email in ("N/A", ""):
+            log_lines.append(f"[{lid}] {lead.business_name[:35]} — No email, skipped")
+            failed_count += 1
+            continue
+
+        if lead.notes and "Email sent" in str(lead.notes):
+            log_lines.append(f"[{lid}] {lead.business_name[:35]} — Already sent, skipped")
+            continue
+
+        # Build RawProspect for personalizer
+        prospect = RawProspect(
+            business_name=lead.business_name or '',
+            business_category=lead.business_category or '',
+            country=lead.country or '',
+            city=lead.city or '',
+            email=lead.email,
+            website=lead.website or '',
+            business_research=lead.business_research or '',
+            potential_problem=lead.potential_problem or '',
+            recommended_service=lead.recommended_service or '',
+            recommended_ai_solution=lead.recommended_ai_solution or '',
+            source=lead.source or '',
+            metadata={{'lead_id': lid_int}},
+        )
+
+        try:
+            msg = personalizer.generate_message(prospect)
+            if isinstance(msg, dict):
+                subject = msg.get('subject', f"Quick question regarding {lead.business_name}'s client bookings")
+                body = msg.get('body', '')
+            else:
+                subject = f"Quick question regarding {lead.business_name}'s client bookings"
+                body = str(msg)
+        except Exception as e:
+            log_lines.append(f"[{lid}] {lead.business_name[:35]} — Message gen failed: {str(e)[:50]}")
+            failed_count += 1
+            continue
+
+        # Send email
+        try:
+            result = email_client.send(
+                to_email=lead.email,
+                subject=subject,
+                body_text=body,
+            )
+            is_success = result.get('success', False)
+            gmail_id = result.get('id', '')
+        except Exception as e:
+            is_success = False
+            gmail_id = ''
+            log_lines.append(f"[{lid}] {lead.business_name[:35]} — Send error: {str(e)[:50]}")
+
+        ts = _dt.now().strftime('%Y-%m-%d %H:%M')
+
+        if is_success:
+            sent_count += 1
+            # Update DB
+            lead_repo.update_lead(lid_int, {
+                'is_outreach_lead': True,
+                'notes': f'Email sent {ts} | Gmail ID: {gmail_id}',
+            })
+
+            # Archive to Google Sheets by category
+            if sheets_client.is_configured:
+                try:
+                    row_data = {
+                        'Lead ID': str(lid_int),
+                        'Date Found': ts,
+                        'Business Name': lead.business_name or '',
+                        'Business Category': lead.business_category or '',
+                        'Country': lead.country or '',
+                        'City': lead.city or '',
+                        'Address': lead.address or '',
+                        'Phone': lead.phone or '',
+                        'Email': lead.email or '',
+                        'Website': lead.website or '',
+                        'Google Maps URL': lead.google_maps_url or '',
+                        'Source': lead.source or '',
+                        'Source URL': lead.source_url or '',
+                        'Business Research': (lead.business_research or '')[:500],
+                        'Potential Problem': lead.potential_problem or '',
+                        'Recommended Service': lead.recommended_service or '',
+                        'Recommended AI Solution': (lead.recommended_ai_solution or '')[:500],
+                        'Lead Score': str(lead.lead_score or ''),
+                        'Contact Channel': 'email',
+                        'Initial Message': body[:500] if body else '',
+                        'Initial Contact Date': ts,
+                        'Initial Contact Status': 'Sent',
+                        'Follow-up Status': 'Active',
+                        'Do Not Contact': 'No',
+                        'Human Required': 'No',
+                    }
+                    sheets_client.append_lead_to_category(
+                        row_data,
+                        category=lead.business_category or '',
+                    )
+                    archived_count += 1
+                    log_lines.append(f"[{lid}] {lead.business_name[:35]} — \u2709 SENT + archived to '{lead.business_category or 'Leads'}' tab")
+                except Exception as e:
+                    log_lines.append(f"[{lid}] {lead.business_name[:35]} — \u2709 SENT but Sheets archive failed: {str(e)[:50]}")
+            else:
+                log_lines.append(f"[{lid}] {lead.business_name[:35]} — \u2709 SENT (Sheets not configured)")
+        else:
+            failed_count += 1
+            lead_repo.update_lead(lid_int, {
+                'notes': f'Failed: {result.get("message", "unknown")}',
+            })
+            log_lines.append(f"[{lid}] {lead.business_name[:35]} — \u2716 FAILED: {result.get('message', 'unknown')[:50]}")
+
+    log_lines.append(f"\u2500" * 50)
+    log_lines.append(f"Done: {sent_count} sent, {archived_count} archived, {failed_count} failed")
+    log_lines.append(f"\u2500" * 50)
+
+    return jsonify({
+        'success': True,
+        'sent': sent_count,
+        'archived': archived_count,
+        'failed': failed_count,
+        'log': '\n'.join(log_lines),
+    })
+
+
+@app.route("/review/cleanup", methods=["POST"])
+def review_cleanup():
+    """Purge unselected leads from the local database."""
+    data = request.get_json() or {}
+    purge_ids = data.get("purge_ids", [])
+
+    if not purge_ids:
+        return jsonify({"success": False, "log": "No leads to purge", "purged": 0})
+
+    init_db()
+    lead_repo = LeadRepository()
+    followup_repo = FollowUpRepository()
+    purged = 0
+    log_lines = []
+
+    for lid in purge_ids:
+        try:
+            lid_int = int(lid)
+        except (ValueError, TypeError):
+            continue
+
+        lead = lead_repo.get_lead(lid_int)
+        if not lead:
+            continue
+
+        name = lead.business_name[:35]
+        try:
+            # Delete follow-up state first
+            followup_repo.delete_by_lead_id(lid_int)
+            # Delete the lead
+            lead_repo.delete_lead(lid_int)
+            purged += 1
+            log_lines.append(f"\u2716 Deleted: #{lid_int} {name}")
+        except Exception as e:
+            log_lines.append(f"\u2716 Failed to delete #{lid_int} {name}: {str(e)[:50]}")
+
+    log_lines.insert(0, f"Purged {purged} leads from database")
+
+    return jsonify({
+        'success': True,
+        'purged': purged,
+        'log': '\n'.join(log_lines),
+    })
 
 
 def run_web_dashboard(host: str = "0.0.0.0", port: int = 5000, debug: bool = False):
