@@ -11,6 +11,7 @@ from typing import Dict, List, Optional
 from app.config.settings import settings
 from app.database import LeadRepository
 from app.sources.base import LeadSource, RawProspect
+from app.utils.categories import normalize_category
 from app.sources.google_search import GoogleSearchSource
 from app.sources.google_maps import GoogleMapsSource
 from app.sources.linkedin import LinkedInSource
@@ -51,6 +52,9 @@ class LeadDiscoveryAgent:
         Respects the daily target location — never expands beyond the given
         country/city/category.
         """
+        # Normalize category to fix typos (e.g. "Dintest" -> "Dentist")
+        category = normalize_category(category)
+
         all_prospects: List[RawProspect] = []
 
         # Foreign markets get more budget to web search (Tavily) since
@@ -71,6 +75,8 @@ class LeadDiscoveryAgent:
             "public_jobs": (PublicJobSource, search_recent_requirements),
             "serpapi": (SerpAPISource, search_google),
         }
+
+        osm_prospect_count = 0  # Track OSM results for fallback decision
 
         for source_name, (source_class, enabled) in source_map.items():
             if not enabled:
@@ -113,6 +119,7 @@ class LeadDiscoveryAgent:
                         country=country, city=city, category=category,
                         max_results=budget,
                     )
+                    osm_prospect_count = len(results)
                 else:
                     results = source.search(
                         country=country, city=city, category=category,
@@ -123,6 +130,36 @@ class LeadDiscoveryAgent:
                 logger.info(f"  -> {source_name}: found {len(results)} prospects")
             except Exception as e:
                 logger.error(f"  -> {source_name} failed: {e}")
+
+        # ── Automatic Google Search fallback for OSM ──
+        # If OpenStreetMap returned 0 raw prospects (empty results or timeout),
+        # automatically execute Google Search for the same category/location
+        # to ensure we still have a chance of finding leads. The fallback
+        # prospects go through the same dedup, retail filter, and verification
+        # pipeline as all other sources.
+        if osm_prospect_count == 0:
+            logger.info(
+                f"OSM returned 0 prospects for '{category}' in {city}, {country}. "
+                "Triggering automatic Google Search fallback..."
+            )
+            try:
+                fallback_source = GoogleSearchSource()
+                if fallback_source.is_configured:
+                    fallback_budget = int(max_results * (0.6 if is_foreign else 0.4))
+                    fallback_results = fallback_source.search(
+                        country=country, city=city, category=category,
+                        max_results=fallback_budget,
+                    )
+                    all_prospects.extend(fallback_results)
+                    logger.info(
+                        f"  -> Google Search (fallback): found {len(fallback_results)} prospects"
+                    )
+                else:
+                    logger.warning(
+                        "Google Search fallback skipped: search API not configured."
+                    )
+            except Exception as e:
+                logger.error(f"  -> Google Search fallback failed: {e}")
 
         # Merge and deduplicate
         merged = self._deduplicate(all_prospects)
