@@ -166,8 +166,17 @@ class DailyCampaign:
                 message = personalizer.generate_message(p)
 
                 # ── Review Mode: Display full outreach message ──
+                # Wrapped in try/except so a console encoding error (e.g.
+                # UnicodeEncodeError on Windows cp1252) cannot prevent
+                # lead persistence and outreach.
                 if settings.campaign.review_mode or settings.campaign.dry_run:
-                    self._display_outreach_message(p, message, lead_db_id=db_lead.id)
+                    try:
+                        self._display_outreach_message(p, message, lead_db_id=db_lead.id)
+                    except Exception as display_exc:
+                        logger.warning(
+                            f"Display failed for {p.business_name} (non-critical): "
+                            f"{type(display_exc).__name__}: {display_exc}"
+                        )
 
                 # Send outreach
                 result = outreach.send_initial(p, message, db_lead.id)
@@ -359,7 +368,12 @@ class DailyCampaign:
 
         print(f"  Message:")
         for line in message.split("\n"):
-            print(f"  {line}")
+            try:
+                print(f"  {line}")
+            except UnicodeEncodeError:
+                # Preserve content where possible; replace only the
+                # characters the console cannot render.
+                print(f"  {line.encode('ascii', 'replace').decode('ascii')}")
 
         print(border)
         print()
@@ -393,7 +407,16 @@ class DailyCampaign:
 +--------------------------------------------------+
 """
         logger.info(report)
-        print(report)
+        try:
+            print(report)
+        except UnicodeEncodeError:
+            # Windows cp1252 console cannot render some Unicode.
+            # Fall back to ASCII-safe rendering — the report is already
+            # saved to file with full UTF-8 content.
+            try:
+                print(report.encode("ascii", "replace").decode("ascii"))
+            except Exception:
+                pass  # Last resort: swallow display error, report is in log/file
 
         # Save report to file
         from app.config.settings import LOG_DIR
