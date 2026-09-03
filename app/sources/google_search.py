@@ -99,7 +99,12 @@ class GoogleSearchSource(LeadSource):
         **kwargs,
     ) -> List[RawProspect]:
         if not self.is_configured:
-            logger.warning("Search API not configured. Skipping.")
+            logger.warning(
+                f"[GoogleSearch] Search API not configured. "
+                f"Provider: {settings.search.provider}, "
+                f"API key present: {bool(settings.search.api_key)}. "
+                f"Set SEARCH_API_KEY env var to enable."
+            )
             return []
 
         is_foreign = country.lower().strip() in self.FOREIGN_MARKETS
@@ -164,7 +169,9 @@ class GoogleSearchSource(LeadSource):
         return unique[:max_results]
 
     def _execute_search(self, query: str, max_results: int = 10) -> List[RawProspect]:
-        """Route to the configured search provider. Catches all exceptions."""
+        """Route to the configured search provider. Catches all exceptions
+        and logs detailed diagnostics for API authentication, rate-limit,
+        and network errors so production misconfigurations are visible."""
         provider = settings.search.provider.lower()
 
         try:
@@ -177,16 +184,30 @@ class GoogleSearchSource(LeadSource):
             elif provider == "bing":
                 return self._search_bing(query, max_results)
             else:
-                logger.warning(f"Unknown search provider: {provider}")
+                logger.warning(
+                    f"[GoogleSearch] Unknown search provider: '{provider}'. "
+                    f"Valid options: tavily, serpapi, google_cse, bing."
+                )
                 return []
         except Exception as e:
-            logger.error(f"Search failed ({provider}): {e}")
+            logger.error(
+                f"[GoogleSearch] Search failed (provider={provider}, query='{query[:80]}...'): "
+                f"{type(e).__name__}: {e}"
+            )
             return []
 
     def _search_tavily(self, query: str, max_results: int) -> List[RawProspect]:
         """Search using Tavily API."""
         try:
-            from tavily import TavilyClient
+            from tavily import TavilyClient  # noqa: lazy import
+        except ImportError:
+            logger.error(
+                "[GoogleSearch] Tavily library not installed. "
+                "Run: pip install tavily-python"
+            )
+            return []
+
+        try:
 
             client = TavilyClient(api_key=settings.search.api_key)
             response = client.search(query=query, max_results=max_results)
@@ -218,7 +239,9 @@ class GoogleSearchSource(LeadSource):
             return prospects
 
         except Exception as e:
-            logger.error(f"Tavily search failed: {e}")
+            logger.error(
+                f"[GoogleSearch] Tavily search failed: {type(e).__name__}: {e}"
+            )
             return []
 
     def _search_serpapi(self, query: str, max_results: int) -> List[RawProspect]:
@@ -235,7 +258,35 @@ class GoogleSearchSource(LeadSource):
             resp = requests.get(
                 "https://serpapi.com/search", params=params, timeout=30
             )
+
+            # Log HTTP-level errors (auth failure, rate limit, etc.)
+            if resp.status_code == 401:
+                logger.error(
+                    "[GoogleSearch] SerpAPI authentication failed (HTTP 401). "
+                    "Check that SEARCH_API_KEY is a valid SerpAPI key."
+                )
+                return []
+            elif resp.status_code == 429:
+                logger.error(
+                    "[GoogleSearch] SerpAPI rate limited (HTTP 429). "
+                    "Quota exceeded or too many requests."
+                )
+                return []
+            elif resp.status_code != 200:
+                logger.error(
+                    f"[GoogleSearch] SerpAPI returned HTTP {resp.status_code}: "
+                    f"{resp.text[:200]}"
+                )
+                return []
+
             data = resp.json()
+
+            # SerpAPI can return error info even on 200
+            if "error" in data:
+                logger.error(
+                    f"[GoogleSearch] SerpAPI returned error: {data['error']}"
+                )
+                return []
 
             prospects = []
             for result in data.get("organic_results", []):
@@ -259,7 +310,9 @@ class GoogleSearchSource(LeadSource):
             return prospects
 
         except Exception as e:
-            logger.error(f"SerpAPI search failed: {e}")
+            logger.error(
+                f"[GoogleSearch] SerpAPI search failed: {type(e).__name__}: {e}"
+            )
             return []
 
     def _search_google_cse(self, query: str, max_results: int) -> List[RawProspect]:
@@ -279,7 +332,37 @@ class GoogleSearchSource(LeadSource):
                 params=params,
                 timeout=30,
             )
+
+            # Log HTTP-level errors
+            if resp.status_code == 403:
+                logger.error(
+                    "[GoogleSearch] Google CSE access denied (HTTP 403). "
+                    "Check API key and CSE ID are valid."
+                )
+                return []
+            elif resp.status_code == 429:
+                logger.error(
+                    "[GoogleSearch] Google CSE rate limited (HTTP 429). "
+                    "Daily quota exceeded."
+                )
+                return []
+            elif resp.status_code != 200:
+                logger.error(
+                    f"[GoogleSearch] Google CSE returned HTTP {resp.status_code}: "
+                    f"{resp.text[:200]}"
+                )
+                return []
+
             data = resp.json()
+
+            # Google CSE returns errors in the response body
+            if "error" in data:
+                error_info = data["error"]
+                logger.error(
+                    f"[GoogleSearch] Google CSE API error: "
+                    f"{error_info.get('code', '?')} - {error_info.get('message', '?')}"
+                )
+                return []
 
             prospects = []
             for item in data.get("items", []):
@@ -299,7 +382,9 @@ class GoogleSearchSource(LeadSource):
             return prospects
 
         except Exception as e:
-            logger.error(f"Google CSE search failed: {e}")
+            logger.error(
+                f"[GoogleSearch] Google CSE search failed: {type(e).__name__}: {e}"
+            )
             return []
 
     def _search_bing(self, query: str, max_results: int) -> List[RawProspect]:
@@ -315,6 +400,27 @@ class GoogleSearchSource(LeadSource):
                 params=params,
                 timeout=30,
             )
+
+            # Log HTTP-level errors
+            if resp.status_code == 401:
+                logger.error(
+                    "[GoogleSearch] Bing API authentication failed (HTTP 401). "
+                    "Check that SEARCH_API_KEY is a valid Bing subscription key."
+                )
+                return []
+            elif resp.status_code == 429:
+                logger.error(
+                    "[GoogleSearch] Bing API rate limited (HTTP 429). "
+                    "Quota exceeded."
+                )
+                return []
+            elif resp.status_code != 200:
+                logger.error(
+                    f"[GoogleSearch] Bing API returned HTTP {resp.status_code}: "
+                    f"{resp.text[:200]}"
+                )
+                return []
+
             data = resp.json()
 
             prospects = []
@@ -335,7 +441,9 @@ class GoogleSearchSource(LeadSource):
             return prospects
 
         except Exception as e:
-            logger.error(f"Bing search failed: {e}")
+            logger.error(
+                f"[GoogleSearch] Bing search failed: {type(e).__name__}: {e}"
+            )
             return []
 
     # ---- Text extraction helpers ----

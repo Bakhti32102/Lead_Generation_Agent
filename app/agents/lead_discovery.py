@@ -80,14 +80,15 @@ class LeadDiscoveryAgent:
 
         for source_name, (source_class, enabled) in source_map.items():
             if not enabled:
+                logger.info(f"[Discovery] Source '{source_name}' disabled by config. Skipping.")
                 continue
 
             source = source_class()
             if not source.is_configured:
-                logger.info(f"Source '{source_name}' not configured. Skipping.")
+                logger.warning(f"[Discovery] Source '{source_name}' not configured — missing API key or credentials. Skipping.")
                 continue
 
-            logger.info(f"Searching {source_name} for {category} in {city}, {country}...")
+            logger.info(f"[Discovery] Searching {source_name} for '{category}' in {city}, {country}...")
             try:
                 # Budget allocation: foreign markets give more to web search
                 if source_name == "serpapi":
@@ -102,7 +103,7 @@ class LeadDiscoveryAgent:
                             max_results=max_results // 4,
                             search_type="linkedin",
                         )
-                        results.extend(linkedin_results)
+                        results.extend(linkin_results)
                 elif source_name == "google_search":
                     # Foreign: give web search 60% of budget
                     # Domestic: give it 40%
@@ -127,9 +128,9 @@ class LeadDiscoveryAgent:
                     )
 
                 all_prospects.extend(results)
-                logger.info(f"  -> {source_name}: found {len(results)} prospects")
+                logger.info(f"[Discovery]   -> {source_name}: found {len(results)} prospects")
             except Exception as e:
-                logger.error(f"  -> {source_name} failed: {e}")
+                logger.error(f"[Discovery]   -> {source_name} FAILED: {type(e).__name__}: {e}")
 
         # ── Automatic Google Search fallback for OSM ──
         # If OpenStreetMap returned 0 raw prospects (empty results or timeout),
@@ -138,28 +139,39 @@ class LeadDiscoveryAgent:
         # prospects go through the same dedup, retail filter, and verification
         # pipeline as all other sources.
         if osm_prospect_count == 0:
-            logger.info(
-                f"OSM returned 0 prospects for '{category}' in {city}, {country}. "
-                "Triggering automatic Google Search fallback..."
+            logger.warning(
+                f"[Discovery] OSM returned 0 prospects for '{category}' in {city}, {country}. "
+                "Executing Google Search fallback..."
             )
             try:
                 fallback_source = GoogleSearchSource()
                 if fallback_source.is_configured:
                     fallback_budget = int(max_results * (0.6 if is_foreign else 0.4))
+                    logger.info(
+                        f"[Discovery] Google Search fallback: provider={settings.search.provider}, "
+                        f"budget={fallback_budget}, query='{category} in {city}, {country}'"
+                    )
                     fallback_results = fallback_source.search(
                         country=country, city=city, category=category,
                         max_results=fallback_budget,
                     )
                     all_prospects.extend(fallback_results)
                     logger.info(
-                        f"  -> Google Search (fallback): found {len(fallback_results)} prospects"
+                        f"[Discovery] Google Search fallback complete: {len(fallback_results)} prospects found"
                     )
                 else:
-                    logger.warning(
-                        "Google Search fallback skipped: search API not configured."
+                    logger.error(
+                        f"[Discovery] Google Search fallback SKIPPED: "
+                        f"SEARCH_API_KEY not configured (provider={settings.search.provider}). "
+                        f"Set SEARCH_API_KEY env var to enable fallback."
                     )
             except Exception as e:
-                logger.error(f"  -> Google Search fallback failed: {e}")
+                logger.error(
+                    f"[Discovery] Google Search fallback FAILED: {type(e).__name__}: {e}\n"
+                    f"  Provider: {settings.search.provider}\n"
+                    f"  API key present: {bool(settings.search.api_key)}\n"
+                    f"  This means zero leads were recovered from OSM AND Google Search."
+                )
 
         # Merge and deduplicate
         merged = self._deduplicate(all_prospects)
